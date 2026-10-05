@@ -440,6 +440,17 @@ private:
     std::atomic<TimestampSource> timestamp_source_ {TimestampSource::SYSTEM};
     std::atomic_bool ptp_tai_to_utc_enabled_ = false;
 
+    // SEAL: stamps name the capture instant in host time, and PTP-stamped
+    // frames pass only while the camera's clock is locked.
+    std::atomic<int64_t> stamp_offset_ns_{0};
+    std::atomic<double> ptp_lock_max_offset_s_{1e-4};
+    std::atomic<int> ptp_lock_samples_{3};
+    std::atomic<int> ptp_locked_in_a_row_{0};
+    std::atomic<int64_t> ptp_last_status_steady_ns_{0};
+    std::atomic<int64_t> ptp_last_offset_ns_{0};
+    bool stamps_trusted();
+    void on_ptp_status(const multisense::MultiSenseStatus &status);
+
     size_t time_offset_buffer_size_ = 8;
     std::optional<std::chrono::nanoseconds> camera_host_time_offset_{std::nullopt};
 

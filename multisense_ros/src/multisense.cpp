@@ -100,10 +100,10 @@ rclcpp::Time create_time(const lms::ImuSample &sample,
     return rclcpp::Time(0);
 }
 
-rclcpp::Time create_time(const lms::ImageFrame &frame,
-                         const TimestampSource &time_source,
-                         const std::optional<std::chrono::nanoseconds> &camera_host_offset,
-                         const bool ptp_tai_to_utc_enabled)
+rclcpp::Time create_raw_time(const lms::ImageFrame &frame,
+                             const TimestampSource &time_source,
+                             const std::optional<std::chrono::nanoseconds> &camera_host_offset,
+                             const bool ptp_tai_to_utc_enabled)
 {
     switch (time_source)
     {
@@ -132,6 +132,17 @@ rclcpp::Time create_time(const lms::ImageFrame &frame,
     }
 
     return rclcpp::Time(0);
+}
+
+// SEAL: the instant the frame was taken, not the instant the camera stamped.
+rclcpp::Time create_time(const lms::ImageFrame &frame,
+                         const TimestampSource &time_source,
+                         const std::optional<std::chrono::nanoseconds> &camera_host_offset,
+                         const bool ptp_tai_to_utc_enabled,
+                         const int64_t stamp_offset_ns)
+{
+    return create_raw_time(frame, time_source, camera_host_offset, ptp_tai_to_utc_enabled) +
+        rclcpp::Duration(std::chrono::nanoseconds{stamp_offset_ns});
 }
 
 bool is_time_valid(const lms::ImuSample &sample, const TimestampSource &time_source)
@@ -764,6 +775,9 @@ MultiSense::MultiSense(const std::string& node_name,
 
     pointcloud_max_range_ = params.pointcloud_max_range;
     ptp_tai_to_utc_enabled_ = params.time.ptp_tai_to_utc_enabled;
+    stamp_offset_ns_ = static_cast<int64_t>(params.time.stamp_offset_s * 1e9);
+    ptp_lock_max_offset_s_ = params.time.ptp_lock_max_offset_s;
+    ptp_lock_samples_ = static_cast<int>(params.time.ptp_lock_samples);
 
     if (const auto status = channel_->set_config(update_config(config)); status != multisense::Status::OK)
     {
@@ -779,6 +793,7 @@ MultiSense::MultiSense(const std::string& node_name,
                 {
                     if (const auto status = channel_->get_system_status(); status)
                     {
+                        on_ptp_status(status.value());
                         publish_status(status.value());
                         last_response_time_ns_ = this->now();
                     }
@@ -1100,6 +1115,10 @@ void MultiSense::image_publisher()
     {
         if (const auto image_frame = image_frame_notifier_.wait(timeout) ; image_frame)
         {
+            if (!stamps_trusted())
+            {
+                continue;
+            }
             if (!is_time_valid(image_frame.value(), timestamp_source_))
             {
                 RCLCPP_WARN(get_logger(), "FrameId %ld has a negative or zero time. Skipping image publish", image_frame->frame_id);
@@ -1107,7 +1126,7 @@ void MultiSense::image_publisher()
             }
 
             const auto ros_time = create_time(image_frame.value(), timestamp_source_, camera_host_time_offset_,
-                                              ptp_tai_to_utc_enabled_);
+                                              ptp_tai_to_utc_enabled_, stamp_offset_ns_);
 
             if (image_frame->stereo_histogram)
             {
@@ -1230,6 +1249,10 @@ void MultiSense::depth_publisher()
     {
         if (const auto image_frame = image_frame_notifier_.wait(timeout) ; image_frame)
         {
+            if (!stamps_trusted())
+            {
+                continue;
+            }
             if (!is_time_valid(image_frame.value(), timestamp_source_))
             {
                 RCLCPP_WARN(get_logger(), "FrameId %ld has a negative or zero time. Skipping image publish", image_frame->frame_id);
@@ -1237,7 +1260,7 @@ void MultiSense::depth_publisher()
             }
 
             const auto ros_time = create_time(image_frame.value(), timestamp_source_, camera_host_time_offset_,
-                                              ptp_tai_to_utc_enabled_);
+                                              ptp_tai_to_utc_enabled_, stamp_offset_ns_);
 
             if (image_frame->has_image(disparity_source))
             {
@@ -1306,6 +1329,10 @@ void MultiSense::point_cloud_publisher()
     {
         if (const auto image_frame = image_frame_notifier_.wait(timeout) ; image_frame)
         {
+            if (!stamps_trusted())
+            {
+                continue;
+            }
             if (!is_time_valid(image_frame.value(), timestamp_source_))
             {
                 RCLCPP_WARN(get_logger(), "FrameId %ld has a negative or zero time. Skipping image publish", image_frame->frame_id);
@@ -1313,7 +1340,7 @@ void MultiSense::point_cloud_publisher()
             }
 
             const auto ros_time = create_time(image_frame.value(), timestamp_source_, camera_host_time_offset_,
-                                              ptp_tai_to_utc_enabled_);
+                                              ptp_tai_to_utc_enabled_, stamp_offset_ns_);
 
             if (image_frame->has_image(disparity_source))
             {
@@ -1401,6 +1428,10 @@ void MultiSense::color_publisher()
     {
         if (const auto image_frame = image_frame_notifier_.wait(timeout) ; image_frame)
         {
+            if (!stamps_trusted())
+            {
+                continue;
+            }
             if (!is_time_valid(image_frame.value(), timestamp_source_))
             {
                 RCLCPP_WARN(get_logger(), "FrameId %ld has a negative or zero time. Skipping image publish", image_frame->frame_id);
@@ -1408,7 +1439,7 @@ void MultiSense::color_publisher()
             }
 
             const auto ros_time = create_time(image_frame.value(), timestamp_source_, camera_host_time_offset_,
-                                              ptp_tai_to_utc_enabled_);
+                                              ptp_tai_to_utc_enabled_, stamp_offset_ns_);
 
             if (num_subscribers(aux_node_, COLOR_TOPIC) > 0)
             {
@@ -1438,6 +1469,10 @@ void MultiSense::imu_publisher()
         {
             for (const auto &sample : imu_frame->samples)
             {
+                if (!stamps_trusted())
+                {
+                    continue;
+                }
                 if (!is_time_valid(sample, timestamp_source_))
                 {
                     RCLCPP_WARN(get_logger(), "IMU smaple has a negative or zero time. Skipping sample publish");
@@ -1923,6 +1958,9 @@ rcl_interfaces::msg::SetParametersResult MultiSense::parameter_callback(const st
 
     pointcloud_max_range_ = param_listener_->get_params().pointcloud_max_range;
     ptp_tai_to_utc_enabled_ = param_listener_->get_params().time.ptp_tai_to_utc_enabled;
+    stamp_offset_ns_ = static_cast<int64_t>(param_listener_->get_params().time.stamp_offset_s * 1e9);
+    ptp_lock_max_offset_s_ = param_listener_->get_params().time.ptp_lock_max_offset_s;
+    ptp_lock_samples_ = static_cast<int>(param_listener_->get_params().time.ptp_lock_samples);
 
     for (const auto &parameter : parameters)
     {
@@ -1992,3 +2030,41 @@ rcl_interfaces::msg::SetParametersResult MultiSense::parameter_callback(const st
 }
 
 } // namespace
+
+namespace multisense_ros {
+
+// SEAL: a PTP stamp names host time only once the camera's clock follows the
+// grandmaster. ptp_grandmaster_present is sticky since boot, so the offset is
+// what tells a held lock from a lost one.
+void MultiSense::on_ptp_status(const multisense::MultiSenseStatus &status)
+{
+    const bool locked = status.ptp && status.ptp->grandmaster_present &&
+        std::abs(std::chrono::duration<double>(status.ptp->grandmaster_offset).count()) <
+            ptp_lock_max_offset_s_.load();
+    ptp_last_offset_ns_ = status.ptp ? status.ptp->grandmaster_offset.count() : 0;
+    ptp_locked_in_a_row_ = locked ? ptp_locked_in_a_row_.load() + 1 : 0;
+    ptp_last_status_steady_ns_ = std::chrono::steady_clock::now().time_since_epoch().count();
+}
+
+bool MultiSense::stamps_trusted()
+{
+    if (timestamp_source_ != TimestampSource::PTP)
+    {
+        return true;
+    }
+    // Statuses are polled at 1 Hz: three missed means the lock is unknown.
+    constexpr auto max_status_age = std::chrono::seconds{3};
+    const auto status_age = std::chrono::steady_clock::now().time_since_epoch() -
+        std::chrono::nanoseconds{ptp_last_status_steady_ns_.load()};
+    if (ptp_locked_in_a_row_ >= ptp_lock_samples_ && status_age < max_status_age)
+    {
+        return true;
+    }
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                         "PTP not locked (grandmaster offset %ld ns, %d locked statuses in a row): "
+                         "dropping frames until it is", ptp_last_offset_ns_.load(),
+                         ptp_locked_in_a_row_.load());
+    return false;
+}
+
+}
