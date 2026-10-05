@@ -2042,8 +2042,25 @@ void MultiSense::on_ptp_status(const multisense::MultiSenseStatus &status)
         std::abs(std::chrono::duration<double>(status.ptp->grandmaster_offset).count()) <
             ptp_lock_max_offset_s_.load();
     ptp_last_offset_ns_ = status.ptp ? status.ptp->grandmaster_offset.count() : 0;
+    const bool was_trusted = ptp_locked_in_a_row_ >= ptp_lock_samples_;
     ptp_locked_in_a_row_ = locked ? ptp_locked_in_a_row_.load() + 1 : 0;
     ptp_last_status_steady_ns_ = std::chrono::steady_clock::now().time_since_epoch().count();
+    const bool trusted = ptp_locked_in_a_row_ >= ptp_lock_samples_;
+    // One line per transition, so a lost lock shows in the session log.
+    if (timestamp_source_ == TimestampSource::PTP && trusted != was_trusted)
+    {
+        if (trusted)
+        {
+            RCLCPP_INFO(get_logger(), "PTP locked (grandmaster offset %ld ns): publishing frames",
+                        ptp_last_offset_ns_.load());
+        }
+        else
+        {
+            RCLCPP_WARN(get_logger(), "PTP lock lost (%s, grandmaster offset %ld ns): dropping frames",
+                        status.ptp ? "offset over the limit" : "no PTP status",
+                        ptp_last_offset_ns_.load());
+        }
+    }
 }
 
 bool MultiSense::stamps_trusted()
