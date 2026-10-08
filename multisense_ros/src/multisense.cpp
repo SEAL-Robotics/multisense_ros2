@@ -705,7 +705,8 @@ MultiSense::MultiSense(const std::string& node_name,
                const std::string& tf_prefix,
                bool use_image_transport,
                bool use_sensor_qos,
-               bool publish_static_tf):
+               bool publish_static_tf,
+               bool h264_images):
     Node(node_name, options),
     channel_(std::move(channel)),
     left_node_(create_sub_node(LEFT)),
@@ -724,6 +725,12 @@ MultiSense::MultiSense(const std::string& node_name,
     if (!channel_)
     {
         throw std::runtime_error("Invalid channel");
+    }
+
+    h264_images_ = h264_images;
+    if (h264_images_ && !H264Decoder::available())
+    {
+        throw std::runtime_error("h264_images is set but multisense_ros was built without GStreamer");
     }
 
     //
@@ -836,7 +843,7 @@ void MultiSense::initialize_stereo_publishers(const multisense::MultiSenseConfig
         MONO_TOPIC,
         left_cal,
         qos,
-        create_publisher_options({ds::LEFT_MONO_RAW}, get_full_topic_name(left_node_, MONO_TOPIC)),
+        create_publisher_options({h264_images_ ? ds::LEFT_MONO_COMPRESSED : ds::LEFT_MONO_RAW}, get_full_topic_name(left_node_, MONO_TOPIC)),
         use_image_transport);
 
     right_mono_cam_pub_ = std::make_shared<ImagePublisher>(
@@ -844,7 +851,7 @@ void MultiSense::initialize_stereo_publishers(const multisense::MultiSenseConfig
         MONO_TOPIC,
         right_cal,
         qos,
-        create_publisher_options({ds::RIGHT_MONO_RAW}, get_full_topic_name(right_node_, MONO_TOPIC)),
+        create_publisher_options({h264_images_ ? ds::RIGHT_MONO_COMPRESSED : ds::RIGHT_MONO_RAW}, get_full_topic_name(right_node_, MONO_TOPIC)),
         use_image_transport);
 
     left_rect_cam_pub_ = std::make_shared<ImagePublisher>(
@@ -852,7 +859,7 @@ void MultiSense::initialize_stereo_publishers(const multisense::MultiSenseConfig
         RECT_TOPIC,
         left_rect_cal,
         qos,
-        create_publisher_options({ds::LEFT_RECTIFIED_RAW}, get_full_topic_name(left_node_, RECT_TOPIC)),
+        create_publisher_options({h264_images_ ? ds::LEFT_RECTIFIED_COMPRESSED : ds::LEFT_RECTIFIED_RAW}, get_full_topic_name(left_node_, RECT_TOPIC)),
         use_image_transport);
 
     right_rect_cam_pub_ = std::make_shared<ImagePublisher>(
@@ -860,7 +867,7 @@ void MultiSense::initialize_stereo_publishers(const multisense::MultiSenseConfig
         RECT_TOPIC,
         right_rect_cal,
         qos,
-        create_publisher_options({ds::RIGHT_RECTIFIED_RAW}, get_full_topic_name(right_node_, RECT_TOPIC)),
+        create_publisher_options({h264_images_ ? ds::RIGHT_RECTIFIED_COMPRESSED : ds::RIGHT_RECTIFIED_RAW}, get_full_topic_name(right_node_, RECT_TOPIC)),
         use_image_transport);
 
     depth_cam_pub_ = std::make_shared<ImagePublisher>(
@@ -1176,6 +1183,34 @@ void MultiSense::image_publisher()
                         publish_image(image, right_rect_cam_pub_, right_rect_image_, frame_id_rectified_right_, ros_time);
                         break;
                     }
+                    case lms::DataSource::LEFT_MONO_COMPRESSED:
+                    {
+                        if (num_subscribers(left_node_, MONO_TOPIC) == 0) continue;
+                        publish_h264_image(image, left_mono_decoder_, "left/image_mono", left_mono_cam_pub_,
+                                           left_mono_image_, frame_id_left_, ros_time);
+                        break;
+                    }
+                    case lms::DataSource::RIGHT_MONO_COMPRESSED:
+                    {
+                        if (num_subscribers(right_node_, MONO_TOPIC) == 0) continue;
+                        publish_h264_image(image, right_mono_decoder_, "right/image_mono", right_mono_cam_pub_,
+                                           right_mono_image_, frame_id_right_, ros_time);
+                        break;
+                    }
+                    case lms::DataSource::LEFT_RECTIFIED_COMPRESSED:
+                    {
+                        if (num_subscribers(left_node_, RECT_TOPIC) == 0) continue;
+                        publish_h264_image(image, left_rect_decoder_, "left/image_rect", left_rect_cam_pub_,
+                                           left_rect_image_, frame_id_rectified_left_, ros_time);
+                        break;
+                    }
+                    case lms::DataSource::RIGHT_RECTIFIED_COMPRESSED:
+                    {
+                        if (num_subscribers(right_node_, RECT_TOPIC) == 0) continue;
+                        publish_h264_image(image, right_rect_decoder_, "right/image_rect", right_rect_cam_pub_,
+                                           right_rect_image_, frame_id_rectified_right_, ros_time);
+                        break;
+                    }
                     case lms::DataSource::LEFT_DISPARITY_RAW:
                     {
                         if (num_subscribers(left_node_, DISPARITY_TOPIC) > 0)
@@ -1238,6 +1273,55 @@ void MultiSense::image_publisher()
             }
         }
     }
+}
+
+void MultiSense::publish_h264_image(const lms::Image &image,
+                                    std::unique_ptr<H264Decoder> &decoder,
+                                    const std::string &decoder_name,
+                                    std::shared_ptr<ImagePublisher> publisher,
+                                    sensor_msgs::msg::Image &ros_image,
+                                    const std::string &frame_id,
+                                    const rclcpp::Time &ros_time)
+{
+    if (!decoder)
+    {
+        // Thrown out of image_publisher()'s thread it would terminate the driver.
+        try
+        {
+            decoder = std::make_unique<H264Decoder>(decoder_name);
+        }
+        catch (const std::exception &e)
+        {
+            RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 5000, "MultiSense: %s", e.what());
+            return;
+        }
+        RCLCPP_INFO(get_logger(), "MultiSense: decoding %s from H.264 with %s",
+                    decoder_name.c_str(), decoder->decoder_element().c_str());
+    }
+
+    // LibMultiSense reports the uncompressed size as image_data_length for H.264
+    // images; the encoded access unit is the rest of the message buffer.
+    const auto offset = static_cast<size_t>(image.image_data_offset);
+    if (!image.raw_data || image.raw_data->size() <= offset)
+    {
+        return;
+    }
+
+    auto decoded = decoder->decode(image.raw_data->data() + offset, image.raw_data->size() - offset,
+                                   image.width, image.height);
+    if (!decoded)
+    {
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                             "MultiSense: %s H.264 frame did not decode; dropped", decoder_name.c_str());
+        return;
+    }
+
+    lms::Image mono = image;
+    mono.image_data_length = decoded->size();
+    mono.raw_data = std::move(decoded);
+    mono.image_data_offset = 0;
+    mono.format = lms::Image::PixelFormat::MONO8;
+    publish_image(mono, publisher, ros_image, frame_id, ros_time);
 }
 
 void MultiSense::depth_publisher()

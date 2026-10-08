@@ -26,6 +26,13 @@ initialization:
       default_value: false
       read_only: true
       description: "Use image transport for publishing image topics"
+  h264_images:
+      type: bool
+      default_value: false
+      read_only: true
+      description: "Request the left/right mono and rectified images from the camera as H.264 and
+                     decode them on the host, publishing the same MONO8 topics. Disparity, aux and
+                     cost stay raw. Needs a build with GStreamer"
   use_sensor_qos:
       type: bool
       default_value: false

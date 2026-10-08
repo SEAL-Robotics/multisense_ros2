@@ -84,7 +84,8 @@ int main(int argc, char** argv)
                                                                        params.tf_prefix,
                                                                        params.use_image_transport,
                                                                        params.use_sensor_qos,
-                                                                       params.publish_static_tf);
+                                                                       params.publish_static_tf,
+                                                                       params.h264_images);
 
             rclcpp::executors::SingleThreadedExecutor executor;
             executor.add_node(sensor);

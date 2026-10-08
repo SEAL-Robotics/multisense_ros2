@@ -51,6 +51,7 @@
 #include <multisense_msgs/msg/info.hpp>
 #include <multisense_msgs/msg/status.hpp>
 
+#include "multisense_ros/h264_decoder.h"
 #include "multisense_ros/publisher_utilities.h"
 #include <multisense_ros/multisense_parameters.hpp>
 
@@ -141,7 +142,8 @@ public:
            const std::string& tf_prefix,
            bool use_image_transport,
            bool use_sensor_qos,
-           bool publish_static_tf);
+           bool publish_static_tf,
+           bool h264_images = false);
 
     ~MultiSense();
 
@@ -251,6 +253,14 @@ private:
 
     void image_publisher();
 
+    void publish_h264_image(const multisense::Image &image,
+                            std::unique_ptr<H264Decoder> &decoder,
+                            const std::string &decoder_name,
+                            std::shared_ptr<ImagePublisher> publisher,
+                            sensor_msgs::msg::Image &ros_image,
+                            const std::string &frame_id,
+                            const rclcpp::Time &ros_time);
+
     //
     // Function which waits for image frames from the camera, and publishes depth images if there is
     // an active subscription to the corresponding depth topic
@@ -327,6 +337,15 @@ private:
     // Timer callback object for publishing status
 
     rclcpp::TimerBase::SharedPtr status_timer_ = nullptr;
+
+    //
+    // H.264 mode: one decoder per image source, used only from image_publisher()
+
+    bool h264_images_ = false;
+    std::unique_ptr<H264Decoder> left_mono_decoder_ = nullptr;
+    std::unique_ptr<H264Decoder> right_mono_decoder_ = nullptr;
+    std::unique_ptr<H264Decoder> left_rect_decoder_ = nullptr;
+    std::unique_ptr<H264Decoder> right_rect_decoder_ = nullptr;
 
     //
     // Data publishers

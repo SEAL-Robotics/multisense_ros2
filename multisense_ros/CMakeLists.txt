@@ -34,6 +34,10 @@ find_package(stereo_msgs REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
+find_package(PkgConfig)
+if(PkgConfig_FOUND)
+  pkg_check_modules(GST IMPORTED_TARGET gstreamer-1.0 gstreamer-app-1.0 gstreamer-video-1.0)
+endif()
 
 include_directories(include)
 
@@ -43,8 +47,17 @@ generate_parameter_library(thermal_parameters src/thermal_parameters.yaml)
 
 add_library(${PROJECT_NAME}
             src/multisense.cpp
+            src/h264_decoder.cpp
             src/publisher_utilities.cpp
             src/thermal_publisher.cpp)
+
+# Optional so hosts without GStreamer still build; h264_images then refuses to start.
+if(GST_FOUND)
+  target_link_libraries(${PROJECT_NAME} PRIVATE PkgConfig::GST)
+  target_compile_definitions(${PROJECT_NAME} PRIVATE MULTISENSE_ROS_HAVE_GSTREAMER)
+else()
+  message(WARNING "GStreamer not found: multisense_ros builds without h264_images support")
+endif()
 
 target_link_libraries(${PROJECT_NAME} PUBLIC
                       multisense_init_parameters

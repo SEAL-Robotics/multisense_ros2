@@ -11,12 +11,15 @@
 
   <buildtool_depend>ament_cmake</buildtool_depend>
   <buildtool_depend>eigen3_cmake_module</buildtool_depend>
+  <buildtool_depend>pkg-config</buildtool_depend>
   <buildtool_depend>yaml-cpp</buildtool_depend>
 
   <build_depend>angles</build_depend>
   <build_depend>eigen</build_depend>
   <build_depend>generate_parameter_library</build_depend>
   <build_depend>geometry_msgs</build_depend>
+  <build_depend>libgstreamer1.0-dev</build_depend>
+  <build_depend>libgstreamer-plugins-base1.0-dev</build_depend>
   <build_depend>libopencv-dev</build_depend>
   <build_depend>image_geometry</build_depend>
   <build_depend>image_transport</build_depend>
@@ -36,6 +39,8 @@
   <exec_depend>geometry_msgs</exec_depend>
   <exec_depend>image_geometry</exec_depend>
   <exec_depend>image_transport</exec_depend>
+  <exec_depend>gstreamer1.0-libav</exec_depend>
+  <exec_depend>gstreamer1.0-plugins-bad</exec_depend>
   <exec_depend>libopencv-dev</exec_depend>
   <exec_depend>multisense_lib</exec_depend>
   <exec_depend>multisense_msgs</exec_depend>
