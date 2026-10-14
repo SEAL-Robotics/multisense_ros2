@@ -71,3 +71,11 @@ TEST(H264Packet, EmptyOrMissingAccessUnitIsRejected)
     EXPECT_EQ(make_h264_packet(&raw, 3, "f", stamp), nullptr);
     EXPECT_EQ(make_h264_packet(&raw, 9, "f", stamp), nullptr);
 }
+
+TEST(H264Packet, QosIsReliableWithAboutASecondOfHistoryAtTenHertz)
+{
+    const auto qos = multisense_ros::h264_packet_qos().get_rmw_qos_profile();
+    EXPECT_EQ(qos.reliability, RMW_QOS_POLICY_RELIABILITY_RELIABLE);
+    EXPECT_EQ(qos.history, RMW_QOS_POLICY_HISTORY_KEEP_LAST);
+    EXPECT_EQ(qos.depth, multisense_ros::H264_PACKET_QOS_DEPTH);
+}

@@ -876,16 +876,16 @@ void MultiSense::initialize_stereo_publishers(const multisense::MultiSenseConfig
     {
         // Same sources as the decoded topics: a subscriber to either one turns the camera stream on.
         left_mono_h264_pub_ = left_node_->create_publisher<sensor_msgs::msg::CompressedImage>(
-            MONO_H264_TOPIC, qos,
+            MONO_H264_TOPIC, h264_packet_qos(),
             create_publisher_options({ds::LEFT_MONO_COMPRESSED}, get_full_topic_name(left_node_, MONO_H264_TOPIC)));
         right_mono_h264_pub_ = right_node_->create_publisher<sensor_msgs::msg::CompressedImage>(
-            MONO_H264_TOPIC, qos,
+            MONO_H264_TOPIC, h264_packet_qos(),
             create_publisher_options({ds::RIGHT_MONO_COMPRESSED}, get_full_topic_name(right_node_, MONO_H264_TOPIC)));
         left_rect_h264_pub_ = left_node_->create_publisher<sensor_msgs::msg::CompressedImage>(
-            RECT_H264_TOPIC, qos,
+            RECT_H264_TOPIC, h264_packet_qos(),
             create_publisher_options({ds::LEFT_RECTIFIED_COMPRESSED}, get_full_topic_name(left_node_, RECT_H264_TOPIC)));
         right_rect_h264_pub_ = right_node_->create_publisher<sensor_msgs::msg::CompressedImage>(
-            RECT_H264_TOPIC, qos,
+            RECT_H264_TOPIC, h264_packet_qos(),
             create_publisher_options({ds::RIGHT_RECTIFIED_COMPRESSED}, get_full_topic_name(right_node_, RECT_H264_TOPIC)));
     }
 
