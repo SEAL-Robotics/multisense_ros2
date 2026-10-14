@@ -678,6 +678,8 @@ constexpr char MultiSense::HISTOGRAM_TOPIC[];
 constexpr char MultiSense::RAW_CONFIG_TOPIC[];
 constexpr char MultiSense::MONO_TOPIC[];
 constexpr char MultiSense::RECT_TOPIC[];
+constexpr char MultiSense::MONO_H264_TOPIC[];
+constexpr char MultiSense::RECT_H264_TOPIC[];
 constexpr char MultiSense::DISPARITY_TOPIC[];
 constexpr char MultiSense::DISPARITY_IMAGE_TOPIC[];
 constexpr char MultiSense::DEPTH_TOPIC[];
@@ -869,6 +871,23 @@ void MultiSense::initialize_stereo_publishers(const multisense::MultiSenseConfig
         qos,
         create_publisher_options({h264_images_ ? ds::RIGHT_RECTIFIED_COMPRESSED : ds::RIGHT_RECTIFIED_RAW}, get_full_topic_name(right_node_, RECT_TOPIC)),
         use_image_transport);
+
+    if (h264_images_)
+    {
+        // Same sources as the decoded topics: a subscriber to either one turns the camera stream on.
+        left_mono_h264_pub_ = left_node_->create_publisher<sensor_msgs::msg::CompressedImage>(
+            MONO_H264_TOPIC, qos,
+            create_publisher_options({ds::LEFT_MONO_COMPRESSED}, get_full_topic_name(left_node_, MONO_H264_TOPIC)));
+        right_mono_h264_pub_ = right_node_->create_publisher<sensor_msgs::msg::CompressedImage>(
+            MONO_H264_TOPIC, qos,
+            create_publisher_options({ds::RIGHT_MONO_COMPRESSED}, get_full_topic_name(right_node_, MONO_H264_TOPIC)));
+        left_rect_h264_pub_ = left_node_->create_publisher<sensor_msgs::msg::CompressedImage>(
+            RECT_H264_TOPIC, qos,
+            create_publisher_options({ds::LEFT_RECTIFIED_COMPRESSED}, get_full_topic_name(left_node_, RECT_H264_TOPIC)));
+        right_rect_h264_pub_ = right_node_->create_publisher<sensor_msgs::msg::CompressedImage>(
+            RECT_H264_TOPIC, qos,
+            create_publisher_options({ds::RIGHT_RECTIFIED_COMPRESSED}, get_full_topic_name(right_node_, RECT_H264_TOPIC)));
+    }
 
     depth_cam_pub_ = std::make_shared<ImagePublisher>(
         left_node_,
@@ -1185,30 +1204,38 @@ void MultiSense::image_publisher()
                     }
                     case lms::DataSource::LEFT_MONO_COMPRESSED:
                     {
-                        if (num_subscribers(left_node_, MONO_TOPIC) == 0) continue;
-                        publish_h264_image(image, left_mono_decoder_, "left/image_mono", left_mono_cam_pub_,
-                                           left_mono_image_, frame_id_left_, ros_time);
+                        const auto demand = h264_demand(num_subscribers(left_node_, MONO_TOPIC),
+                                                        num_subscribers(left_node_, MONO_H264_TOPIC));
+                        if (demand.packet) publish_h264_packet(image, left_mono_h264_pub_, frame_id_left_, ros_time);
+                        if (demand.decode) publish_h264_image(image, left_mono_decoder_, "left/image_mono", left_mono_cam_pub_,
+                                                              left_mono_image_, frame_id_left_, ros_time);
                         break;
                     }
                     case lms::DataSource::RIGHT_MONO_COMPRESSED:
                     {
-                        if (num_subscribers(right_node_, MONO_TOPIC) == 0) continue;
-                        publish_h264_image(image, right_mono_decoder_, "right/image_mono", right_mono_cam_pub_,
-                                           right_mono_image_, frame_id_right_, ros_time);
+                        const auto demand = h264_demand(num_subscribers(right_node_, MONO_TOPIC),
+                                                        num_subscribers(right_node_, MONO_H264_TOPIC));
+                        if (demand.packet) publish_h264_packet(image, right_mono_h264_pub_, frame_id_right_, ros_time);
+                        if (demand.decode) publish_h264_image(image, right_mono_decoder_, "right/image_mono", right_mono_cam_pub_,
+                                                              right_mono_image_, frame_id_right_, ros_time);
                         break;
                     }
                     case lms::DataSource::LEFT_RECTIFIED_COMPRESSED:
                     {
-                        if (num_subscribers(left_node_, RECT_TOPIC) == 0) continue;
-                        publish_h264_image(image, left_rect_decoder_, "left/image_rect", left_rect_cam_pub_,
-                                           left_rect_image_, frame_id_rectified_left_, ros_time);
+                        const auto demand = h264_demand(num_subscribers(left_node_, RECT_TOPIC),
+                                                        num_subscribers(left_node_, RECT_H264_TOPIC));
+                        if (demand.packet) publish_h264_packet(image, left_rect_h264_pub_, frame_id_rectified_left_, ros_time);
+                        if (demand.decode) publish_h264_image(image, left_rect_decoder_, "left/image_rect", left_rect_cam_pub_,
+                                                              left_rect_image_, frame_id_rectified_left_, ros_time);
                         break;
                     }
                     case lms::DataSource::RIGHT_RECTIFIED_COMPRESSED:
                     {
-                        if (num_subscribers(right_node_, RECT_TOPIC) == 0) continue;
-                        publish_h264_image(image, right_rect_decoder_, "right/image_rect", right_rect_cam_pub_,
-                                           right_rect_image_, frame_id_rectified_right_, ros_time);
+                        const auto demand = h264_demand(num_subscribers(right_node_, RECT_TOPIC),
+                                                        num_subscribers(right_node_, RECT_H264_TOPIC));
+                        if (demand.packet) publish_h264_packet(image, right_rect_h264_pub_, frame_id_rectified_right_, ros_time);
+                        if (demand.decode) publish_h264_image(image, right_rect_decoder_, "right/image_rect", right_rect_cam_pub_,
+                                                              right_rect_image_, frame_id_rectified_right_, ros_time);
                         break;
                     }
                     case lms::DataSource::LEFT_DISPARITY_RAW:
@@ -1272,6 +1299,23 @@ void MultiSense::image_publisher()
                 }
             }
         }
+    }
+}
+
+void MultiSense::publish_h264_packet(const lms::Image &image,
+                                     rclcpp::Publisher<sensor_msgs::msg::CompressedImage>::SharedPtr publisher,
+                                     const std::string &frame_id,
+                                     const rclcpp::Time &ros_time)
+{
+    if (!publisher || !image.raw_data)
+    {
+        return;
+    }
+
+    if (auto packet = make_h264_packet(image.raw_data.get(), static_cast<size_t>(image.image_data_offset),
+                                       frame_id, ros_time))
+    {
+        publisher->publish(std::move(packet));
     }
 }
 

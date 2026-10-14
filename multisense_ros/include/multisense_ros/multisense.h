@@ -41,6 +41,7 @@
 #include <image_transport/image_transport.hpp>
 #include <sensor_msgs/distortion_models.hpp>
 #include <sensor_msgs/msg/camera_info.hpp>
+#include <sensor_msgs/msg/compressed_image.hpp>
 #include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <std_msgs/msg/string.hpp>
@@ -52,6 +53,7 @@
 #include <multisense_msgs/msg/status.hpp>
 
 #include "multisense_ros/h264_decoder.h"
+#include "multisense_ros/h264_packet.h"
 #include "multisense_ros/publisher_utilities.h"
 #include <multisense_ros/multisense_parameters.hpp>
 
@@ -179,6 +181,8 @@ private:
     static constexpr char RAW_CONFIG_TOPIC[] = "raw_config";
     static constexpr char MONO_TOPIC[] = "image_mono";
     static constexpr char RECT_TOPIC[] = "image_rect";
+    static constexpr char MONO_H264_TOPIC[] = "image_mono/h264";
+    static constexpr char RECT_H264_TOPIC[] = "image_rect/h264";
     static constexpr char DISPARITY_TOPIC[] = "disparity";
     static constexpr char DISPARITY_IMAGE_TOPIC[] = "disparity_image";
     static constexpr char DEPTH_TOPIC[] = "depth";
@@ -252,6 +256,15 @@ private:
     // an active subscription to the corresponding image topic
 
     void image_publisher();
+
+    //
+    // Publish the camera's encoded access unit as-is on a packet topic. Skips frames with no
+    // access unit
+
+    void publish_h264_packet(const multisense::Image &image,
+                             rclcpp::Publisher<sensor_msgs::msg::CompressedImage>::SharedPtr publisher,
+                             const std::string &frame_id,
+                             const rclcpp::Time &ros_time);
 
     void publish_h264_image(const multisense::Image &image,
                             std::unique_ptr<H264Decoder> &decoder,
@@ -346,6 +359,14 @@ private:
     std::unique_ptr<H264Decoder> right_mono_decoder_ = nullptr;
     std::unique_ptr<H264Decoder> left_rect_decoder_ = nullptr;
     std::unique_ptr<H264Decoder> right_rect_decoder_ = nullptr;
+
+    //
+    // H.264 access units as published by the camera, created only when h264_images_ is set
+
+    rclcpp::Publisher<sensor_msgs::msg::CompressedImage>::SharedPtr left_mono_h264_pub_ = nullptr;
+    rclcpp::Publisher<sensor_msgs::msg::CompressedImage>::SharedPtr right_mono_h264_pub_ = nullptr;
+    rclcpp::Publisher<sensor_msgs::msg::CompressedImage>::SharedPtr left_rect_h264_pub_ = nullptr;
+    rclcpp::Publisher<sensor_msgs::msg::CompressedImage>::SharedPtr right_rect_h264_pub_ = nullptr;
 
     //
     // Data publishers

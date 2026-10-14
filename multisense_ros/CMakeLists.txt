@@ -126,6 +126,13 @@ install(
   DESTINATION share/${PROJECT_NAME}/cmake
 )
 
+if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(test_h264_packet test/test_h264_packet.cpp)
+  target_include_directories(test_h264_packet PRIVATE include)
+  ament_target_dependencies(test_h264_packet sensor_msgs)
+endif()
+
 ament_export_targets(multisense_ros-targets HAS_LIBRARY_TARGET)
 ament_export_include_directories(include)
 
