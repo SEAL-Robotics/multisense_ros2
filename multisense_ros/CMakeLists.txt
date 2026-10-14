@@ -93,6 +93,9 @@ target_link_libraries(ros_driver PUBLIC ${PROJECT_NAME})
 ament_target_dependencies(ros_driver PUBLIC
                           rclcpp)
 
+add_executable(aux_compressed_probe tools/aux_compressed_probe.cpp)
+target_link_libraries(aux_compressed_probe PRIVATE MultiSense)
+
 install(
   TARGETS
     ${PROJECT_NAME}
@@ -107,7 +110,7 @@ install(
   INCLUDES DESTINATION include
 )
 
-install(TARGETS ros_driver
+install(TARGETS ros_driver aux_compressed_probe
         DESTINATION lib/${PROJECT_NAME})
 
 install(
