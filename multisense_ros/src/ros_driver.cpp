@@ -55,17 +55,35 @@ int main(int argc, char** argv)
 
     const std::chrono::seconds timeout{params.reconnect_timeout_s};
 
+    // An unreachable sensor is retried about every 1.7 s for as long as it stays
+    // away: the first failure and a periodic count are logged, not every try.
+    constexpr auto failure_log_period = 60s;
+    std::size_t failed_attempts = 0;
+    std::chrono::steady_clock::time_point last_failure_log;
+
     do
     {
-        RCLCPP_INFO(initialize_node->get_logger(), "multisense_ros: attempting to connect to sensor @ \"%s\"",
-                    sensor_ip.c_str());
+        if (failed_attempts == 0)
+        {
+            RCLCPP_INFO(initialize_node->get_logger(), "multisense_ros: attempting to connect to sensor @ \"%s\"",
+                        sensor_ip.c_str());
+        }
         try
         {
             auto channel = lms::Channel::create(lms::Channel::Config{sensor_ip, params.sensor_mtu});
             if (nullptr == channel)
             {
-                RCLCPP_ERROR(initialize_node->get_logger(), "multisense_ros: failed to create communication channel to sensor @ \"%s\"",
-                             sensor_ip.c_str());
+                ++failed_attempts;
+                const auto now = std::chrono::steady_clock::now();
+                if (failed_attempts == 1 || now - last_failure_log >= failure_log_period)
+                {
+                    last_failure_log = now;
+                    RCLCPP_ERROR(initialize_node->get_logger(),
+                                 "multisense_ros: failed to create communication channel to sensor @ \"%s\" "
+                                 "(%zu failed attempts so far%s)",
+                                 sensor_ip.c_str(), failed_attempts,
+                                 params.reconnect ? ", retrying every second" : "");
+                }
 
                 if (params.reconnect)
                 {
@@ -75,8 +93,9 @@ int main(int argc, char** argv)
 
                 return EXIT_FAILURE;
             }
-            RCLCPP_INFO(initialize_node->get_logger(), "multisense_ros: connected to sensor @ \"%s\"",
-                        sensor_ip.c_str());
+            RCLCPP_INFO(initialize_node->get_logger(), "multisense_ros: connected to sensor @ \"%s\" after %zu failed attempts",
+                        sensor_ip.c_str(), failed_attempts);
+            failed_attempts = 0;
 
             auto sensor = std::make_shared<multisense_ros::MultiSense>("sensor",
                                                                        rclcpp::NodeOptions{},
