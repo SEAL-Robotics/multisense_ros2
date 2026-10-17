@@ -80,9 +80,9 @@ int main(int argc, char** argv)
                     last_failure_log = now;
                     RCLCPP_ERROR(initialize_node->get_logger(),
                                  "multisense_ros: failed to create communication channel to sensor @ \"%s\" "
-                                 "(%zu failed attempts so far%s)",
+                                 "(failed attempts so far: %zu%s)",
                                  sensor_ip.c_str(), failed_attempts,
-                                 params.reconnect ? ", retrying every second" : "");
+                                 params.reconnect ? "; retrying about every 1.7 s" : "");
                 }
 
                 if (params.reconnect)
@@ -93,7 +93,7 @@ int main(int argc, char** argv)
 
                 return EXIT_FAILURE;
             }
-            RCLCPP_INFO(initialize_node->get_logger(), "multisense_ros: connected to sensor @ \"%s\" after %zu failed attempts",
+            RCLCPP_INFO(initialize_node->get_logger(), "multisense_ros: connected to sensor @ \"%s\" (failed attempts before: %zu)",
                         sensor_ip.c_str(), failed_attempts);
             failed_attempts = 0;
 
