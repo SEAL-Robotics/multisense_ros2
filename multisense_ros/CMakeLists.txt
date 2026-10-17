@@ -48,6 +48,8 @@ generate_parameter_library(thermal_parameters src/thermal_parameters.yaml)
 add_library(${PROJECT_NAME}
             src/multisense.cpp
             src/h264_decoder.cpp
+            src/aux_jpeg.cpp
+            src/ycbcr.cpp
             src/publisher_utilities.cpp
             src/thermal_publisher.cpp)
 
@@ -134,6 +136,10 @@ if(BUILD_TESTING)
   ament_add_gtest(test_h264_packet test/test_h264_packet.cpp)
   target_include_directories(test_h264_packet PRIVATE include)
   ament_target_dependencies(test_h264_packet rclcpp sensor_msgs)
+  ament_add_gtest(test_ycbcr test/test_ycbcr.cpp)
+  target_link_libraries(test_ycbcr ${PROJECT_NAME})
+  ament_add_gtest(test_aux_jpeg test/test_aux_jpeg.cpp)
+  target_link_libraries(test_aux_jpeg ${PROJECT_NAME})
 endif()
 
 ament_export_targets(multisense_ros-targets HAS_LIBRARY_TARGET)

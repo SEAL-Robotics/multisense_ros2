@@ -104,7 +104,9 @@ int main(int argc, char** argv)
                                                                        params.use_image_transport,
                                                                        params.use_sensor_qos,
                                                                        params.publish_static_tf,
-                                                                       params.h264_images);
+                                                                       params.h264_images,
+                                                                       params.aux_jpeg,
+                                                                       static_cast<int>(params.aux_jpeg_quality));
 
             rclcpp::executors::SingleThreadedExecutor executor;
             executor.add_node(sensor);

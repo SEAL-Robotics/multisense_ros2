@@ -687,6 +687,7 @@ constexpr char MultiSense::OPENNI_DEPTH_TOPIC[];
 constexpr char MultiSense::COST_TOPIC[];
 constexpr char MultiSense::COLOR_TOPIC[];
 constexpr char MultiSense::RECT_COLOR_TOPIC[];
+constexpr char MultiSense::RECT_COLOR_JPEG_TOPIC[];
 constexpr char MultiSense::POINTCLOUD_TOPIC[];
 constexpr char MultiSense::LUMA_POINTCLOUD_TOPIC[];
 constexpr char MultiSense::COLOR_POINTCLOUD_TOPIC[];
@@ -708,7 +709,9 @@ MultiSense::MultiSense(const std::string& node_name,
                bool use_image_transport,
                bool use_sensor_qos,
                bool publish_static_tf,
-               bool h264_images):
+               bool h264_images,
+               bool aux_jpeg,
+               int aux_jpeg_quality):
     Node(node_name, options),
     channel_(std::move(channel)),
     left_node_(create_sub_node(LEFT)),
@@ -733,6 +736,18 @@ MultiSense::MultiSense(const std::string& node_name,
     if (h264_images_ && !H264Decoder::available())
     {
         throw std::runtime_error("h264_images is set but multisense_ros was built without GStreamer");
+    }
+
+    aux_jpeg_ = aux_jpeg;
+    aux_jpeg_quality_ = aux_jpeg_quality;
+    if (aux_jpeg_ && !JpegEncoder::available())
+    {
+        throw std::runtime_error("aux_jpeg is set but multisense_ros was built without GStreamer");
+    }
+    if (aux_jpeg_ && use_image_transport)
+    {
+        // image_transport would advertise the same <topic>/compressed name itself.
+        throw std::runtime_error("aux_jpeg and use_image_transport both publish image_rect_color/compressed");
     }
 
     //
@@ -965,6 +980,14 @@ void MultiSense::initialize_stereo_publishers(const multisense::MultiSenseConfig
             qos,
             create_publisher_options({ds::AUX_RECTIFIED_RAW}, get_full_topic_name(aux_node_, RECT_COLOR_TOPIC)),
             use_image_transport);
+
+        if (aux_jpeg_)
+        {
+            // Same source as the BGR topic: a subscriber to either one turns the camera stream on.
+            aux_rect_jpeg_pub_ = aux_node_->create_publisher<sensor_msgs::msg::CompressedImage>(
+                RECT_COLOR_JPEG_TOPIC, aux_jpeg_qos(),
+                create_publisher_options({ds::AUX_RECTIFIED_RAW}, get_full_topic_name(aux_node_, RECT_COLOR_JPEG_TOPIC)));
+        }
 
         aux_depth_cam_pub_ = std::make_shared<ImagePublisher>(
             aux_node_,
@@ -1569,23 +1592,120 @@ void MultiSense::color_publisher()
             const auto ros_time = create_time(image_frame.value(), timestamp_source_, camera_host_time_offset_,
                                               ptp_tai_to_utc_enabled_, stamp_offset_ns_);
 
-            if (num_subscribers(aux_node_, COLOR_TOPIC) > 0)
+            if (image_frame->aux_color_encoding != lms::ColorImageEncoding::YCBCR420)
             {
-                if (auto bgr_image = lms::create_bgr_image(image_frame.value(), lms::DataSource::AUX_RAW); bgr_image)
-                {
-                    publish_image(bgr_image.value(), aux_rgb_cam_pub_, aux_rgb_image_, frame_id_aux_, ros_time);
-                }
+                continue;
             }
 
-            if (num_subscribers(aux_node_, RECT_COLOR_TOPIC) > 0)
+            const auto has = [&](lms::DataSource source) { return image_frame->has_image(source); };
+
+            if (num_subscribers(aux_node_, COLOR_TOPIC) > 0 &&
+                has(lms::DataSource::AUX_LUMA_RAW) && has(lms::DataSource::AUX_CHROMA_RAW))
             {
-                if (auto bgr_image = lms::create_bgr_image(image_frame.value(), lms::DataSource::AUX_RECTIFIED_RAW); bgr_image)
-                {
-                    publish_image(bgr_image.value(), aux_rgb_rect_cam_pub_, aux_rect_rgb_image_, frame_id_rectified_aux_, ros_time);
-                }
+                publish_bgr(image_frame->get_image(lms::DataSource::AUX_LUMA_RAW),
+                            image_frame->get_image(lms::DataSource::AUX_CHROMA_RAW),
+                            aux_rgb_cam_pub_, frame_id_aux_, ros_time);
+            }
+
+            if (!has(lms::DataSource::AUX_LUMA_RECTIFIED_RAW) || !has(lms::DataSource::AUX_CHROMA_RECTIFIED_RAW))
+            {
+                continue;
+            }
+            const auto &luma = image_frame->get_image(lms::DataSource::AUX_LUMA_RECTIFIED_RAW);
+            const auto &chroma = image_frame->get_image(lms::DataSource::AUX_CHROMA_RECTIFIED_RAW);
+            const auto demand = aux_colour_demand(num_subscribers(aux_node_, RECT_COLOR_TOPIC),
+                                                  aux_rect_jpeg_pub_ ? num_subscribers(aux_node_, RECT_COLOR_JPEG_TOPIC) : 0);
+            if (demand.bgr)
+            {
+                publish_bgr(luma, chroma, aux_rgb_rect_cam_pub_, frame_id_rectified_aux_, ros_time);
+            }
+            if (demand.jpeg)
+            {
+                publish_aux_jpeg(luma, chroma, ros_time);
             }
         }
     }
+}
+
+void MultiSense::publish_bgr(const lms::Image &luma,
+                             const lms::Image &chroma,
+                             std::shared_ptr<ImagePublisher> publisher,
+                             const std::string &frame_id,
+                             const rclcpp::Time &ros_time)
+{
+    if (luma.format != lms::Image::PixelFormat::MONO8 || chroma.format != lms::Image::PixelFormat::MONO16 ||
+        !luma.raw_data || !chroma.raw_data)
+    {
+        return;
+    }
+
+    if (!ycbcr_)
+    {
+        const auto start = std::chrono::steady_clock::now();
+        ycbcr_ = std::make_unique<YCbCr420ToBgr>();
+        RCLCPP_INFO(get_logger(), "MultiSense: aux colour tables built in %.0f ms",
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+    }
+
+    auto ros_image = std::make_unique<sensor_msgs::msg::Image>();
+    ros_image->header.frame_id = frame_id;
+    ros_image->header.stamp = ros_time;
+    ros_image->height = luma.height;
+    ros_image->width = luma.width;
+    ros_image->encoding = sensor_msgs::image_encodings::BGR8;
+    ros_image->step = luma.width * 3;
+    ros_image->is_bigendian = (htonl(1) == 1);
+    ros_image->data.resize(static_cast<size_t>(luma.width) * luma.height * 3);
+    (*ycbcr_)(luma.raw_data->data() + luma.image_data_offset,
+              chroma.raw_data->data() + chroma.image_data_offset,
+              luma.width, luma.height, ros_image->data.data());
+
+    auto camera_info = create_camera_info(luma.calibration, ros_image->header, luma.width, luma.height);
+    publisher->publish(std::move(ros_image), std::make_unique<sensor_msgs::msg::CameraInfo>(std::move(camera_info)));
+}
+
+void MultiSense::publish_aux_jpeg(const lms::Image &luma,
+                                  const lms::Image &chroma,
+                                  const rclcpp::Time &ros_time)
+{
+    if (luma.format != lms::Image::PixelFormat::MONO8 || chroma.format != lms::Image::PixelFormat::MONO16 ||
+        !luma.raw_data || !chroma.raw_data)
+    {
+        return;
+    }
+
+    if (!aux_jpeg_encoder_)
+    {
+        // Thrown out of color_publisher()'s thread it would terminate the driver.
+        try
+        {
+            aux_jpeg_encoder_ = std::make_unique<JpegEncoder>("aux/image_rect_color", aux_jpeg_quality_);
+        }
+        catch (const std::exception &e)
+        {
+            RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 5000, "MultiSense: %s", e.what());
+            return;
+        }
+    }
+
+    const std::string element_before = aux_jpeg_encoder_->encoder_element();
+    auto jpeg = aux_jpeg_encoder_->encode(luma.raw_data->data() + luma.image_data_offset,
+                                          chroma.raw_data->data() + chroma.image_data_offset,
+                                          luma.width, luma.height);
+    if (!jpeg)
+    {
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                             "MultiSense: aux/image_rect_color JPEG frame not encoded; dropped");
+        return;
+    }
+    if (!aux_jpeg_logged_ || aux_jpeg_encoder_->encoder_element() != element_before)
+    {
+        RCLCPP_INFO(get_logger(), "MultiSense: encoding aux/image_rect_color as JPEG quality %d with %s",
+                    aux_jpeg_quality_, aux_jpeg_encoder_->encoder_element().c_str());
+        aux_jpeg_logged_ = true;
+    }
+
+    aux_rect_jpeg_pub_->publish(make_aux_jpeg_message(std::move(*jpeg), frame_id_rectified_aux_, ros_time));
 }
 
 void MultiSense::imu_publisher()

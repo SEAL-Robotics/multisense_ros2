@@ -33,6 +33,20 @@ initialization:
       description: "Request the left/right mono and rectified images from the camera as H.264 and
                      decode them on the host, publishing the same MONO8 topics. Disparity, aux and
                      cost stay raw. Needs a build with GStreamer"
+  aux_jpeg:
+      type: bool
+      default_value: false
+      read_only: true
+      description: "Publish aux/image_rect_color/compressed, a JPEG encoded from the aux camera's own
+                     YCbCr planes (NVJPG on a Jetson, else libjpeg), only while it has a subscriber.
+                     Needs a build with GStreamer"
+  aux_jpeg_quality:
+      type: int
+      default_value: 75
+      read_only: true
+      description: "JPEG quality of aux/image_rect_color/compressed, 1-100"
+      validation:
+          bounds<>: [1, 100]
   use_sensor_qos:
       type: bool
       default_value: false

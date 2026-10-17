@@ -54,6 +54,8 @@
 
 #include "multisense_ros/h264_decoder.h"
 #include "multisense_ros/h264_packet.h"
+#include "multisense_ros/aux_jpeg.h"
+#include "multisense_ros/ycbcr.h"
 #include "multisense_ros/publisher_utilities.h"
 #include <multisense_ros/multisense_parameters.hpp>
 
@@ -145,7 +147,9 @@ public:
            bool use_image_transport,
            bool use_sensor_qos,
            bool publish_static_tf,
-           bool h264_images = false);
+           bool h264_images = false,
+           bool aux_jpeg = false,
+           int aux_jpeg_quality = 75);
 
     ~MultiSense();
 
@@ -190,6 +194,7 @@ private:
     static constexpr char COST_TOPIC[] = "cost";
     static constexpr char COLOR_TOPIC[] = "image_color";
     static constexpr char RECT_COLOR_TOPIC[] = "image_rect_color";
+    static constexpr char RECT_COLOR_JPEG_TOPIC[] = "image_rect_color/compressed";
     static constexpr char POINTCLOUD_TOPIC[] = "points2";
     static constexpr char LUMA_POINTCLOUD_TOPIC[] = "image_points2";
     static constexpr char COLOR_POINTCLOUD_TOPIC[] = "image_points2_color";
@@ -293,6 +298,22 @@ private:
     void color_publisher();
 
     //
+    // The aux camera's YCbCr frame as BGR8 on publisher, converted straight into the message
+
+    void publish_bgr(const multisense::Image &luma,
+                     const multisense::Image &chroma,
+                     std::shared_ptr<ImagePublisher> publisher,
+                     const std::string &frame_id,
+                     const rclcpp::Time &ros_time);
+
+    //
+    // The aux camera's YCbCr frame as a JPEG on aux_rect_jpeg_pub_, encoded from its own planes
+
+    void publish_aux_jpeg(const multisense::Image &luma,
+                          const multisense::Image &chroma,
+                          const rclcpp::Time &ros_time);
+
+    //
     // Function which waits for imu frames from the camera, and publishes imu data  if there is
     // an active subscription to the corresponding imu data topic
 
@@ -359,6 +380,17 @@ private:
     std::unique_ptr<H264Decoder> right_mono_decoder_ = nullptr;
     std::unique_ptr<H264Decoder> left_rect_decoder_ = nullptr;
     std::unique_ptr<H264Decoder> right_rect_decoder_ = nullptr;
+
+    //
+    // Aux colour, used only from color_publisher(): the BGR tables are built on first use,
+    // the JPEG topic and encoder exist only when aux_jpeg_ is set
+
+    std::unique_ptr<YCbCr420ToBgr> ycbcr_ = nullptr;
+    bool aux_jpeg_ = false;
+    int aux_jpeg_quality_ = 75;
+    bool aux_jpeg_logged_ = false;
+    std::unique_ptr<JpegEncoder> aux_jpeg_encoder_ = nullptr;
+    rclcpp::Publisher<sensor_msgs::msg::CompressedImage>::SharedPtr aux_rect_jpeg_pub_ = nullptr;
 
     //
     // H.264 access units as published by the camera, created only when h264_images_ is set
