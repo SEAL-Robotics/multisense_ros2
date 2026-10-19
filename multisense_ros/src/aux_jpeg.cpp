@@ -68,15 +68,115 @@ std::unique_ptr<sensor_msgs::msg::CompressedImage> make_aux_jpeg_message(
     return msg;
 }
 
-#ifdef MULTISENSE_ROS_HAVE_GSTREAMER
+AuxJpegWorker::AuxJpegWorker(Encode encode, Publish publish):
+    encode_(std::move(encode)),
+    publish_(std::move(publish)),
+    thread_(&AuxJpegWorker::run, this)
+{
+}
+
+AuxJpegWorker::~AuxJpegWorker()
+{
+    {
+        std::lock_guard<std::mutex> lock{mutex_};
+        stop_ = true;
+        pending_.reset();
+    }
+    wake_.notify_all();
+    thread_.join();
+}
+
+void AuxJpegWorker::post(AuxJpegJob job)
+{
+    {
+        std::lock_guard<std::mutex> lock{mutex_};
+        pending_ = std::move(job);
+    }
+    wake_.notify_one();
+}
+
+void AuxJpegWorker::wait_idle()
+{
+    std::unique_lock<std::mutex> lock{mutex_};
+    idle_.wait(lock, [this] { return !pending_ && !busy_; });
+}
+
+void AuxJpegWorker::run()
+{
+    while (true)
+    {
+        AuxJpegJob job;
+        {
+            std::unique_lock<std::mutex> lock{mutex_};
+            wake_.wait(lock, [this] { return stop_ || pending_; });
+            if (stop_)
+            {
+                return;
+            }
+            job = std::move(*pending_);
+            pending_.reset();
+            busy_ = true;
+        }
+        if (auto jpeg = encode_(job))
+        {
+            publish_(std::move(*jpeg), job.stamp);
+        }
+        {
+            std::lock_guard<std::mutex> lock{mutex_};
+            busy_ = false;
+        }
+        idle_.notify_all();
+    }
+}
+
+std::vector<EncoderCandidate> JpegEncoder::default_candidates(int quality)
+{
+    std::vector<EncoderCandidate> out;
+    for (const char *element : {"nvjpegenc", "jpegenc"})
+    {
+        if (has_encoder(element))
+        {
+            out.push_back({element, std::string{element} + " quality=" + std::to_string(quality)});
+        }
+    }
+    return out;
+}
 
 namespace {
 
-// A frame not out within this window is dropped. nvjpegenc and jpegenc take
-// a few ms on a 1920x1200 frame; the window is shorter after a miss so a
-// failing encoder does not hold up the colour thread.
-constexpr GstClockTime PULL_TIMEOUT = 200 * GST_MSECOND;
-constexpr GstClockTime PULL_TIMEOUT_AFTER_MISS = 20 * GST_MSECOND;
+void check_quality(const std::string &name, int quality)
+{
+    if (quality < 1 || quality > 100)
+    {
+        throw std::invalid_argument("JPEG encoder " + name + ": quality must be 1-100");
+    }
+}
+
+std::vector<EncoderCandidate> named(const std::vector<std::string> &elements, int quality)
+{
+    std::vector<EncoderCandidate> out;
+    for (const auto &element : elements)
+    {
+        out.push_back({element, element + " quality=" + std::to_string(quality)});
+    }
+    return out;
+}
+
+}
+
+JpegEncoder::JpegEncoder(const std::string &name, int quality):
+    JpegEncoder(name, quality, std::vector<std::string>{"nvjpegenc", "jpegenc"})
+{
+}
+
+JpegEncoder::JpegEncoder(const std::string &name, int quality, const std::vector<std::string> &elements):
+    JpegEncoder(name, (check_quality(name, quality), named(elements, quality)), JpegEncoderOptions{}, nullptr)
+{
+}
+
+#ifdef MULTISENSE_ROS_HAVE_GSTREAMER
+
+namespace {
 
 bool has_element(const char *name)
 {
@@ -89,6 +189,22 @@ bool has_element(const char *name)
     return true;
 }
 
+// The first word of a pipeline fragment, which is the element that must exist.
+std::string first_element(const std::string &description)
+{
+    return description.substr(0, description.find_first_of(" !"));
+}
+
+GstClockTime to_gst(std::chrono::milliseconds timeout)
+{
+    return static_cast<GstClockTime>(timeout.count()) * GST_MSECOND;
+}
+
+bool has_property(GstElement *element, const char *property)
+{
+    return g_object_class_find_property(G_OBJECT_GET_CLASS(element), property) != nullptr;
+}
+
 }
 
 struct JpegEncoder::Pipeline
@@ -96,7 +212,10 @@ struct JpegEncoder::Pipeline
     GstElement *pipeline = nullptr;
     GstElement *src = nullptr;
     GstElement *sink = nullptr;
+    GstBufferPool *pool = nullptr;
     guint64 frame_count = 0;
+    uint64_t in_flight = 0;
+    int misses = 0;
     bool last_missed = false;
     bool delivered = false;
 
@@ -105,6 +224,11 @@ struct JpegEncoder::Pipeline
         if (pipeline != nullptr)
         {
             gst_element_set_state(pipeline, GST_STATE_NULL);
+        }
+        if (pool != nullptr)
+        {
+            gst_buffer_pool_set_active(pool, FALSE);
+            gst_object_unref(pool);
         }
         if (src != nullptr) gst_object_unref(src);
         if (sink != nullptr) gst_object_unref(sink);
@@ -123,25 +247,20 @@ bool JpegEncoder::has_encoder(const std::string &element)
     return has_element(element.c_str());
 }
 
-JpegEncoder::JpegEncoder(const std::string &name, int quality):
-    JpegEncoder(name, quality, {"nvjpegenc", "jpegenc"})
-{
-}
-
-JpegEncoder::JpegEncoder(const std::string &name, int quality, const std::vector<std::string> &elements):
+JpegEncoder::JpegEncoder(const std::string &name,
+                         std::vector<EncoderCandidate> candidates,
+                         JpegEncoderOptions options,
+                         WarningSink warn):
     name_(name),
-    quality_(quality)
+    options_(options),
+    warn_(std::move(warn))
 {
-    if (quality < 1 || quality > 100)
-    {
-        throw std::invalid_argument("JPEG encoder " + name + ": quality must be 1-100");
-    }
     gst_init(nullptr, nullptr);
-    for (const auto &element : elements)
+    for (auto &candidate : candidates)
     {
-        if (has_element(element.c_str()))
+        if (has_element(first_element(candidate.description).c_str()))
         {
-            candidates_.push_back(element);
+            candidates_.push_back(std::move(candidate));
         }
     }
     if (candidates_.empty())
@@ -149,19 +268,35 @@ JpegEncoder::JpegEncoder(const std::string &name, int quality, const std::vector
         throw std::runtime_error("JPEG encoder " + name +
                                  ": no JPEG encoder: install nvjpegenc (Jetson) or gstreamer1.0-plugins-good");
     }
-    encoder_element_ = candidates_.front();
 }
 
 JpegEncoder::~JpegEncoder() = default;
 
-bool JpegEncoder::start(const std::string &element, int width, int height)
+const std::string &JpegEncoder::encoder_element() const
+{
+    return candidates_[current_].element;
+}
+
+size_t JpegEncoder::queued_frames() const
+{
+    if (!pipeline_ || !has_property(pipeline_->src, "current-level-buffers"))
+    {
+        return 0;
+    }
+    guint64 level = 0;
+    g_object_get(pipeline_->src, "current-level-buffers", &level, nullptr);
+    return static_cast<size_t>(level);
+}
+
+bool JpegEncoder::start(size_t candidate, int width, int height)
 {
     pipeline_.reset();
+    const std::string caps = "video/x-raw,format=I420,width=" + std::to_string(width) +
+                             ",height=" + std::to_string(height) + ",framerate=0/1";
     const std::string description =
-        "appsrc name=src is-live=true format=time caps=video/x-raw,format=I420,width=" +
-        std::to_string(width) + ",height=" + std::to_string(height) + ",framerate=0/1 ! " +
-        element + " quality=" + std::to_string(quality_) +
-        " ! appsink name=sink sync=false max-buffers=2 drop=false";
+        "appsrc name=src is-live=true format=time caps=" + caps + " ! " +
+        candidates_[candidate].description +
+        " ! appsink name=sink sync=false max-buffers=2 drop=true";
 
     GError *error = nullptr;
     auto pipeline = std::make_unique<Pipeline>();
@@ -173,16 +308,47 @@ bool JpegEncoder::start(const std::string &element, int width, int height)
     }
     pipeline->src = gst_bin_get_by_name(GST_BIN(pipeline->pipeline), "src");
     pipeline->sink = gst_bin_get_by_name(GST_BIN(pipeline->pipeline), "sink");
-    if (pipeline->src == nullptr || pipeline->sink == nullptr ||
+    if (pipeline->src == nullptr || pipeline->sink == nullptr)
+    {
+        return false;
+    }
+
+    // Bounded twice: the queue in front of the encoder drops its oldest frame when full, and the
+    // frames themselves come from a fixed pool, so a stalled encoder cannot grow memory.
+    if (has_property(pipeline->src, "max-buffers") && has_property(pipeline->src, "leaky-type"))
+    {
+        g_object_set(pipeline->src, "max-buffers", static_cast<guint64>(options_.max_queued_frames),
+                     "leaky-type", GST_APP_LEAKY_TYPE_DOWNSTREAM, nullptr);
+    }
+    GstCaps *pool_caps = gst_caps_from_string(caps.c_str());
+    pipeline->pool = gst_buffer_pool_new();
+    GstStructure *config = gst_buffer_pool_get_config(pipeline->pool);
+    gst_buffer_pool_config_set_params(config, pool_caps, static_cast<guint>(width) * height * 3 / 2, 0,
+                                      static_cast<guint>(options_.max_queued_frames + 2));
+    gst_caps_unref(pool_caps);
+    if (!gst_buffer_pool_set_config(pipeline->pool, config) ||
+        !gst_buffer_pool_set_active(pipeline->pool, TRUE) ||
         gst_element_set_state(pipeline->pipeline, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE)
     {
         return false;
     }
     pipeline_ = std::move(pipeline);
-    encoder_element_ = element;
     width_ = width;
     height_ = height;
     return true;
+}
+
+void JpegEncoder::fall_back(const std::string &why)
+{
+    const std::string from = candidates_[current_].element;
+    pipeline_.reset();
+    ++current_;
+    if (warn_)
+    {
+        warn_("JPEG encoder " + name_ + ": " + from + " " + why +
+              (current_ < candidates_.size() ? "; falling back to " + candidates_[current_].element
+                                             : "; no encoder left"));
+    }
 }
 
 std::shared_ptr<std::vector<uint8_t>> JpegEncoder::encode(const uint8_t *luma,
@@ -190,22 +356,43 @@ std::shared_ptr<std::vector<uint8_t>> JpegEncoder::encode(const uint8_t *luma,
                                                           int width,
                                                           int height)
 {
-    if (!pipeline_ || width != width_ || height != height_)
+    if (width != width_ || height != height_)
     {
-        // An encoder that will not start or never delivers a frame (nvjpegenc refusing
-        // system-memory input on some L4T release) gives way to the next one for good.
-        while (!candidates_.empty() && !start(candidates_.front(), width, height))
+        // A new mode may suit the preferred encoder that an earlier one did not.
+        pipeline_.reset();
+        current_ = 0;
+        width_ = width;
+        height_ = height;
+    }
+    while (!pipeline_ && current_ < candidates_.size() && !start(current_, width, height))
+    {
+        fall_back("did not start");
+    }
+    if (!pipeline_)
+    {
+        if (current_ >= candidates_.size())
         {
-            candidates_.erase(candidates_.begin());
+            current_ = candidates_.size() - 1;
         }
-        if (!pipeline_)
-        {
-            return nullptr;
-        }
+        return nullptr;
+    }
+    Pipeline &p = *pipeline_;
+
+    // Whatever came out after an earlier frame gave up waiting is for an older stamp.
+    while (GstSample *stale = gst_app_sink_try_pull_sample(GST_APP_SINK(p.sink), 0))
+    {
+        gst_sample_unref(stale);
+        p.in_flight = p.in_flight > 0 ? p.in_flight - 1 : 0;
     }
 
-    const size_t size = static_cast<size_t>(width) * height * 3 / 2;
-    GstBuffer *buffer = gst_buffer_new_allocate(nullptr, size, nullptr);
+    GstBuffer *buffer = nullptr;
+    GstBufferPoolAcquireParams params{};
+    params.flags = GST_BUFFER_POOL_ACQUIRE_FLAG_DONTWAIT;
+    if (gst_buffer_pool_acquire_buffer(p.pool, &buffer, &params) != GST_FLOW_OK)
+    {
+        // Every pooled frame is still with the encoder: it is behind, so this frame is dropped.
+        return nullptr;
+    }
     GstMapInfo map;
     if (!gst_buffer_map(buffer, &map, GST_MAP_WRITE))
     {
@@ -215,32 +402,40 @@ std::shared_ptr<std::vector<uint8_t>> JpegEncoder::encode(const uint8_t *luma,
     fill_i420(luma, chroma, width, height, map.data);
     gst_buffer_unmap(buffer, &map);
 
-    const GstClockTime pts = pipeline_->frame_count++ * GST_MSECOND;
+    const GstClockTime pts = p.frame_count++ * GST_MSECOND;
     GST_BUFFER_PTS(buffer) = pts;
-    if (gst_app_src_push_buffer(GST_APP_SRC(pipeline_->src), buffer) != GST_FLOW_OK)
+    if (gst_app_src_push_buffer(GST_APP_SRC(p.src), buffer) != GST_FLOW_OK)
     {
         return nullptr;
     }
+    ++p.in_flight;
 
-    // The caller stamps the result with this frame's capture time, so an older
-    // frame still queued from a late encode must be dropped, never returned.
-    const GstClockTime timeout = pipeline_->last_missed ? PULL_TIMEOUT_AFTER_MISS : PULL_TIMEOUT;
+    const GstClockTime timeout = !p.delivered ? to_gst(options_.first_frame_timeout)
+                               : p.last_missed ? to_gst(options_.timeout_after_miss)
+                               : to_gst(options_.frame_timeout);
     GstSample *sample = nullptr;
-    while ((sample = gst_app_sink_try_pull_sample(GST_APP_SINK(pipeline_->sink), timeout)) != nullptr)
+    while ((sample = gst_app_sink_try_pull_sample(GST_APP_SINK(p.sink), timeout)) != nullptr)
     {
-        if (GST_BUFFER_PTS(gst_sample_get_buffer(sample)) == pts)
+        const GstClockTime sample_pts = GST_BUFFER_PTS(gst_sample_get_buffer(sample));
+        const bool ours = accept_sample(
+            GST_CLOCK_TIME_IS_VALID(sample_pts) ? std::optional<uint64_t>{sample_pts} : std::nullopt,
+            pts, p.in_flight);
+        p.in_flight = p.in_flight > 0 ? p.in_flight - 1 : 0;
+        if (ours)
         {
             break;
         }
         gst_sample_unref(sample);
     }
-    pipeline_->last_missed = (sample == nullptr);
+    p.last_missed = (sample == nullptr);
     if (sample == nullptr)
     {
-        if (!pipeline_->delivered && candidates_.size() > 1)
+        // A leaky queue drops frames without a sample, so recount what is really out.
+        p.in_flight = queued_frames() + 1;
+        if (!p.delivered && ++p.misses >= options_.misses_before_fallback &&
+            current_ + 1 < candidates_.size())
         {
-            candidates_.erase(candidates_.begin());
-            pipeline_.reset();
+            fall_back("delivered no frame in " + std::to_string(p.misses) + " tries");
         }
         return nullptr;
     }
@@ -252,7 +447,8 @@ std::shared_ptr<std::vector<uint8_t>> JpegEncoder::encode(const uint8_t *luma,
         if (jpeg.size > 2 && jpeg.data[0] == 0xFF && jpeg.data[1] == 0xD8)
         {
             out = std::make_shared<std::vector<uint8_t>>(jpeg.data, jpeg.data + jpeg.size);
-            pipeline_->delivered = true;
+            p.delivered = true;
+            p.misses = 0;
         }
         gst_buffer_unmap(gst_sample_get_buffer(sample), &jpeg);
     }
@@ -274,22 +470,30 @@ bool JpegEncoder::has_encoder(const std::string &)
     return false;
 }
 
-JpegEncoder::JpegEncoder(const std::string &name, int quality):
-    JpegEncoder(name, quality, {})
-{
-}
-
-JpegEncoder::JpegEncoder(const std::string &name, int, const std::vector<std::string> &):
-    quality_(0)
+JpegEncoder::JpegEncoder(const std::string &name, std::vector<EncoderCandidate>, JpegEncoderOptions, WarningSink)
 {
     throw std::runtime_error("JPEG encoder " + name + ": multisense_ros was built without GStreamer");
 }
 
 JpegEncoder::~JpegEncoder() = default;
 
-bool JpegEncoder::start(const std::string &, int, int)
+const std::string &JpegEncoder::encoder_element() const
+{
+    return name_;
+}
+
+size_t JpegEncoder::queued_frames() const
+{
+    return 0;
+}
+
+bool JpegEncoder::start(size_t, int, int)
 {
     return false;
+}
+
+void JpegEncoder::fall_back(const std::string &)
+{
 }
 
 std::shared_ptr<std::vector<uint8_t>> JpegEncoder::encode(const uint8_t *, const uint8_t *, int, int)

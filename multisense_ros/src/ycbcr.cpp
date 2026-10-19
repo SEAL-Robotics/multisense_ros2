@@ -21,6 +21,22 @@ constexpr int BLOCKS_PER_ROW = TABLE_SIDE / 2;
 
 }
 
+bool valid_ycbcr420(const lms::Image &luma, const lms::Image &chroma)
+{
+    if (luma.format != lms::Image::PixelFormat::MONO8 || chroma.format != lms::Image::PixelFormat::MONO16 ||
+        !luma.raw_data || !chroma.raw_data || luma.width <= 0 || luma.height <= 0 ||
+        luma.width % 2 != 0 || luma.height % 2 != 0 ||
+        chroma.width != luma.width / 2 || chroma.height != luma.height / 2 ||
+        luma.image_data_offset < 0 || chroma.image_data_offset < 0)
+    {
+        return false;
+    }
+    const size_t luma_bytes = static_cast<size_t>(luma.width) * luma.height;
+    const size_t chroma_bytes = luma_bytes / 2;
+    return luma.raw_data->size() >= static_cast<size_t>(luma.image_data_offset) + luma_bytes &&
+           chroma.raw_data->size() >= static_cast<size_t>(chroma.image_data_offset) + chroma_bytes;
+}
+
 YCbCr420ToBgr::YCbCr420ToBgr():
     blue_(1u << 16),
     green_(1u << 24),

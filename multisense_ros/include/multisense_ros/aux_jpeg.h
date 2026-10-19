@@ -9,6 +9,12 @@
 #pragma once
 
 #include <array>
+#include <chrono>
+#include <condition_variable>
+#include <functional>
+#include <mutex>
+#include <optional>
+#include <thread>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -69,6 +75,41 @@ std::unique_ptr<sensor_msgs::msg::CompressedImage> make_aux_jpeg_message(
     const std::string &frame_id,
     const builtin_interfaces::msg::Time &stamp);
 
+///
+/// @brief Whether a sample the encoder hands back is the frame just pushed. An encoder that
+///        keeps timestamps is matched on them; one that drops them (sample_pts empty) can
+///        only be matched when that frame is the only one out.
+///
+inline bool accept_sample(std::optional<uint64_t> sample_pts, uint64_t pushed_pts, uint64_t in_flight)
+{
+    return sample_pts ? *sample_pts == pushed_pts : in_flight == 1;
+}
+
+///
+/// @brief A GStreamer encoder to try: element names it for logs, description is the pipeline
+///        fragment between appsrc (I420) and appsink (image/jpeg).
+///
+struct EncoderCandidate
+{
+    std::string element;
+    std::string description;
+};
+
+struct JpegEncoderOptions
+{
+    // NVJPG and CUDA set up on the first frame, which can take a second or more.
+    std::chrono::milliseconds first_frame_timeout{2000};
+    std::chrono::milliseconds frame_timeout{200};
+    // Short after a miss, so a failing encoder does not hold up the frames behind it.
+    std::chrono::milliseconds timeout_after_miss{20};
+    // Misses before a first delivery that give up a candidate for the next one.
+    int misses_before_fallback = 3;
+    // Frames waiting for the encoder at most; a full queue drops its oldest frame.
+    size_t max_queued_frames = 2;
+};
+
+using WarningSink = std::function<void(const std::string &)>;
+
 class JpegEncoder
 {
 public:
@@ -78,20 +119,31 @@ public:
     static bool available();
 
     ///
-    /// @brief Uses the Jetson's NVJPG engine (nvjpegenc) when present, otherwise libjpeg on
-    ///        the CPU (jpegenc). quality is 1-100. Throws if neither encoder exists.
+    /// @brief True when the GStreamer element exists in this installation
     ///
+    static bool has_encoder(const std::string &element);
+
+    ///
+    /// @brief nvjpegenc (the Jetson's NVJPG engine), then jpegenc (libjpeg on the CPU), those
+    ///        of them installed here, at quality 1-100. Empty when neither is.
+    ///
+    static std::vector<EncoderCandidate> default_candidates(int quality);
+
     JpegEncoder(const std::string &name, int quality);
 
     ///
-    /// @brief The same, trying only the named GStreamer encoders, in order
+    /// @brief The named elements, in order, at quality 1-100
     ///
     JpegEncoder(const std::string &name, int quality, const std::vector<std::string> &elements);
 
     ///
-    /// @brief True when the GStreamer element exists in this installation
+    /// @brief The installed ones of candidates, in order. warn hears each fallback.
+    ///        Throws when none is installed.
     ///
-    static bool has_encoder(const std::string &element);
+    JpegEncoder(const std::string &name,
+                std::vector<EncoderCandidate> candidates,
+                JpegEncoderOptions options,
+                WarningSink warn);
     ~JpegEncoder();
 
     JpegEncoder(const JpegEncoder&) = delete;
@@ -99,7 +151,7 @@ public:
 
     ///
     /// @brief Encode one frame from the camera's planes. Returns nullptr when no JPEG of
-    ///        this frame came out in time.
+    ///        this frame came out in time, or the encoder is still busy with earlier ones.
     ///
     std::shared_ptr<std::vector<uint8_t>> encode(const uint8_t *luma,
                                                  const uint8_t *chroma,
@@ -109,19 +161,80 @@ public:
     ///
     /// @brief The GStreamer element doing the encode, for logging
     ///
-    const std::string &encoder_element() const { return encoder_element_; }
+    const std::string &encoder_element() const;
+
+    ///
+    /// @brief Frames waiting in front of the encoder now
+    ///
+    size_t queued_frames() const;
 
 private:
     struct Pipeline;
-    bool start(const std::string &element, int width, int height);
+    bool start(size_t candidate, int width, int height);
+    void fall_back(const std::string &why);
 
     std::string name_;
-    int quality_;
-    std::vector<std::string> candidates_;
+    JpegEncoderOptions options_;
+    WarningSink warn_;
+    std::vector<EncoderCandidate> candidates_;
+    size_t current_ = 0;
     std::unique_ptr<Pipeline> pipeline_;
-    std::string encoder_element_;
     int width_ = 0;
     int height_ = 0;
+};
+
+///
+/// @brief One frame for the aux JPEG worker: the camera's planes, kept alive by their buffers
+///
+struct AuxJpegJob
+{
+    std::shared_ptr<const std::vector<uint8_t>> luma;
+    size_t luma_offset = 0;
+    std::shared_ptr<const std::vector<uint8_t>> chroma;
+    size_t chroma_offset = 0;
+    int width = 0;
+    int height = 0;
+    builtin_interfaces::msg::Time stamp;
+};
+
+///
+/// @brief Encodes on its own thread, so a slow or stalled encoder never holds up the thread
+///        that publishes aux/image_rect_color. Holds one frame waiting: a newer one replaces it.
+///
+class AuxJpegWorker
+{
+public:
+    using Encode = std::function<std::shared_ptr<std::vector<uint8_t>>(const AuxJpegJob &)>;
+    using Publish = std::function<void(std::vector<uint8_t>, const builtin_interfaces::msg::Time &)>;
+
+    AuxJpegWorker(Encode encode, Publish publish);
+    ~AuxJpegWorker();
+
+    AuxJpegWorker(const AuxJpegWorker&) = delete;
+    AuxJpegWorker& operator=(const AuxJpegWorker&) = delete;
+
+    ///
+    /// @brief Hand over a frame; never blocks on the encoder
+    ///
+    void post(AuxJpegJob job);
+
+    ///
+    /// @brief Block until nothing is waiting or being encoded
+    ///
+    void wait_idle();
+
+private:
+    void run();
+
+    Encode encode_;
+    Publish publish_;
+    std::mutex mutex_;
+    std::condition_variable wake_;
+    std::condition_variable idle_;
+    std::optional<AuxJpegJob> pending_;
+    bool busy_ = false;
+    bool stop_ = false;
+    std::thread thread_;
 };
 
 }

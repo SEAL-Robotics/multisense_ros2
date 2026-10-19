@@ -303,15 +303,16 @@ private:
     void publish_bgr(const multisense::Image &luma,
                      const multisense::Image &chroma,
                      std::shared_ptr<ImagePublisher> publisher,
+                     sensor_msgs::msg::Image &ros_image,
                      const std::string &frame_id,
                      const rclcpp::Time &ros_time);
 
     //
-    // The aux camera's YCbCr frame as a JPEG on aux_rect_jpeg_pub_, encoded from its own planes
+    // Hand the aux camera's YCbCr frame to the JPEG worker, which publishes aux_rect_jpeg_pub_
 
-    void publish_aux_jpeg(const multisense::Image &luma,
-                          const multisense::Image &chroma,
-                          const rclcpp::Time &ros_time);
+    void post_aux_jpeg(const multisense::Image &luma,
+                       const multisense::Image &chroma,
+                       const rclcpp::Time &ros_time);
 
     //
     // Function which waits for imu frames from the camera, and publishes imu data  if there is
@@ -382,15 +383,17 @@ private:
     std::unique_ptr<H264Decoder> right_rect_decoder_ = nullptr;
 
     //
-    // Aux colour, used only from color_publisher(): the BGR tables are built on first use,
-    // the JPEG topic and encoder exist only when aux_jpeg_ is set
+    // Aux colour: the BGR tables are built at start when the camera has an aux imager, used
+    // only from color_publisher(); the JPEG topic and its worker exist only when aux_jpeg_ is set
 
     std::unique_ptr<YCbCr420ToBgr> ycbcr_ = nullptr;
     bool aux_jpeg_ = false;
     int aux_jpeg_quality_ = 75;
-    bool aux_jpeg_logged_ = false;
-    std::unique_ptr<JpegEncoder> aux_jpeg_encoder_ = nullptr;
     rclcpp::Publisher<sensor_msgs::msg::CompressedImage>::SharedPtr aux_rect_jpeg_pub_ = nullptr;
+    std::unique_ptr<AuxJpegWorker> aux_jpeg_worker_ = nullptr;
+    // Touched only from the worker's thread
+    std::unique_ptr<JpegEncoder> aux_jpeg_encoder_ = nullptr;
+    std::string aux_jpeg_logged_element_;
 
     //
     // H.264 access units as published by the camera, created only when h264_images_ is set

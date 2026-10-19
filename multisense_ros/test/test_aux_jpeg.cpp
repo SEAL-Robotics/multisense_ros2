@@ -8,7 +8,10 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <cmath>
+#include <fstream>
+#include <thread>
 #include <cstdint>
 #include <memory>
 #include <random>
@@ -195,4 +198,129 @@ TEST(AuxJpeg, QualityOutsideOneToHundredIsRefused)
     }
     EXPECT_THROW(JpegEncoder("test", 0), std::invalid_argument);
     EXPECT_THROW(JpegEncoder("test", 101), std::invalid_argument);
+}
+
+namespace {
+
+constexpr int BIG_W = 1920;
+constexpr int BIG_H = 1200;
+
+// Never delivers a JPEG: a candidate that starts but gives nothing back.
+const EncoderCandidate SILENT{"silent", "valve drop=true ! jpegenc"};
+
+JpegEncoderOptions quick()
+{
+    JpegEncoderOptions options;
+    options.first_frame_timeout = std::chrono::milliseconds{300};
+    options.frame_timeout = std::chrono::milliseconds{100};
+    options.timeout_after_miss = std::chrono::milliseconds{5};
+    return options;
+}
+
+size_t resident_bytes()
+{
+    std::ifstream statm{"/proc/self/statm"};
+    size_t pages = 0, resident = 0;
+    statm >> pages >> resident;
+    return resident * static_cast<size_t>(sysconf(_SC_PAGESIZE));
+}
+
+class Gst : public ::testing::Test
+{
+protected:
+    void SetUp() override
+    {
+        if (!JpegEncoder::available() || !JpegEncoder::has_encoder("jpegenc"))
+        {
+            GTEST_SKIP() << "jpegenc is not installed here";
+        }
+    }
+};
+
+}
+
+TEST(AuxJpeg, OnlyThePushedFrameIsAccepted)
+{
+    EXPECT_TRUE(accept_sample(7, 7, 1));
+    EXPECT_FALSE(accept_sample(6, 7, 2)) << "an older frame queued from a late encode";
+    // An encoder that drops timestamps: the sample can only be ours when ours is the only one out.
+    EXPECT_TRUE(accept_sample(std::nullopt, 7, 1));
+    EXPECT_FALSE(accept_sample(std::nullopt, 7, 2));
+}
+
+TEST_F(Gst, NoInstalledCandidateFailsAtConstruction)
+{
+    EXPECT_THROW(JpegEncoder("test", 75, std::vector<std::string>{"no_such_jpeg_encoder"}), std::runtime_error);
+}
+
+TEST_F(Gst, AStalledEncoderKeepsMemoryFlat)
+{
+    // An encoder that has delivered, then falls far behind: every later push must be dropped
+    // or bounded, never queued: a 1920x1200 frame is 3.5 MB.
+    auto options = quick();
+    options.first_frame_timeout = std::chrono::milliseconds{3000};
+    options.misses_before_fallback = 1000;
+    JpegEncoder encoder{"test", {{"stalled", "identity sleep-time=1000000 ! jpegenc"}}, options, nullptr};
+    std::vector<uint8_t> luma(BIG_W * BIG_H, 90), chroma(BIG_W * BIG_H / 2, 128);
+    ASSERT_NE(encoder.encode(luma.data(), chroma.data(), BIG_W, BIG_H), nullptr);
+    const size_t before = resident_bytes();
+    for (int i = 0; i < 60; ++i)
+    {
+        encoder.encode(luma.data(), chroma.data(), BIG_W, BIG_H);
+    }
+    EXPECT_LE(encoder.queued_frames(), options.max_queued_frames);
+    EXPECT_LT(resident_bytes(), before + 30u * 1024 * 1024);
+}
+
+TEST_F(Gst, ASlowFirstFrameDoesNotGiveUpTheEncoder)
+{
+    // NVJPG or CUDA set-up can take a second on the first frame.
+    std::vector<std::string> warnings;
+    auto options = quick();
+    options.first_frame_timeout = std::chrono::milliseconds{2000};
+    JpegEncoder encoder{"test",
+                        {{"slow", "identity sleep-time=600000 ! jpegenc"}, {"jpegenc", "jpegenc"}},
+                        options, [&](const std::string &w) { warnings.push_back(w); }};
+    std::vector<uint8_t> luma(W * H, 90), chroma(W * H / 2, 128);
+    EXPECT_NE(encoder.encode(luma.data(), chroma.data(), W, H), nullptr);
+    EXPECT_EQ(encoder.encoder_element(), "slow");
+    EXPECT_TRUE(warnings.empty());
+}
+
+TEST_F(Gst, FallsBackOnlyAfterSeveralMissesAndSaysSo)
+{
+    std::vector<std::string> warnings;
+    auto options = quick();
+    options.misses_before_fallback = 3;
+    JpegEncoder encoder{"test", {SILENT, {"jpegenc", "jpegenc"}}, options,
+                        [&](const std::string &w) { warnings.push_back(w); }};
+    std::vector<uint8_t> luma(W * H, 90), chroma(W * H / 2, 128);
+    for (int miss = 0; miss < 2; ++miss)
+    {
+        EXPECT_EQ(encoder.encode(luma.data(), chroma.data(), W, H), nullptr);
+        EXPECT_EQ(encoder.encoder_element(), "silent") << miss;
+    }
+    EXPECT_EQ(encoder.encode(luma.data(), chroma.data(), W, H), nullptr);
+    EXPECT_NE(encoder.encode(luma.data(), chroma.data(), W, H), nullptr);
+    EXPECT_EQ(encoder.encoder_element(), "jpegenc");
+    ASSERT_EQ(warnings.size(), 1u);
+    EXPECT_NE(warnings[0].find("silent"), std::string::npos);
+    EXPECT_NE(warnings[0].find("jpegenc"), std::string::npos);
+}
+
+TEST_F(Gst, ANewFrameSizeRetriesEveryCandidate)
+{
+    std::vector<std::string> warnings;
+    auto options = quick();
+    options.misses_before_fallback = 1;
+    JpegEncoder encoder{"test", {SILENT, {"jpegenc", "jpegenc"}}, options,
+                        [&](const std::string &w) { warnings.push_back(w); }};
+    std::vector<uint8_t> luma(W * H, 90), chroma(W * H / 2, 128);
+    encoder.encode(luma.data(), chroma.data(), W, H);
+    ASSERT_NE(encoder.encode(luma.data(), chroma.data(), W, H), nullptr);
+    ASSERT_EQ(warnings.size(), 1u);
+    // The new mode starts from the preferred encoder again, which here fails again.
+    encoder.encode(luma.data(), chroma.data(), W / 2, H / 2);
+    EXPECT_NE(encoder.encode(luma.data(), chroma.data(), W / 2, H / 2), nullptr);
+    EXPECT_EQ(warnings.size(), 2u);
 }

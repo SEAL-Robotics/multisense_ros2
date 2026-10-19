@@ -140,6 +140,8 @@ if(BUILD_TESTING)
   target_link_libraries(test_ycbcr ${PROJECT_NAME})
   ament_add_gtest(test_aux_jpeg test/test_aux_jpeg.cpp)
   target_link_libraries(test_aux_jpeg ${PROJECT_NAME})
+  ament_add_gtest(test_aux_jpeg_worker test/test_aux_jpeg_worker.cpp)
+  target_link_libraries(test_aux_jpeg_worker ${PROJECT_NAME})
 endif()
 
 ament_export_targets(multisense_ros-targets HAS_LIBRARY_TARGET)

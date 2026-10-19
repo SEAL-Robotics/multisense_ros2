@@ -117,6 +117,25 @@ public:
         camera_info_pub_->publish(std::move(camera_info));
     }
 
+    ///
+    /// @brief Publish an image the caller keeps and refills. Between processes this costs the
+    ///        same serialisation as a unique_ptr and spares a fresh allocation every frame
+    ///
+    void publish(const sensor_msgs::msg::Image &image,
+                 std::unique_ptr<sensor_msgs::msg::CameraInfo> camera_info)
+    {
+        if (image_transport_pub_)
+        {
+            image_transport_pub_->publish(image);
+        }
+        else if (image_pub_)
+        {
+            image_pub_->publish(image);
+        }
+
+        camera_info_pub_->publish(std::move(camera_info));
+    }
+
 private:
 
     std::unique_ptr<image_transport::Publisher> image_transport_pub_ = nullptr;

@@ -110,3 +110,49 @@ TEST(YCbCr420ToBgr, MatchesTheLibraryForEveryLumaAndChromaValue)
     }
     EXPECT_EQ(fast_bgr(converter(), p), library_bgr(p));
 }
+
+namespace {
+
+lms::Image plane(size_t bytes, size_t offset, lms::Image::PixelFormat format, int width, int height)
+{
+    return lms::Image{std::make_shared<std::vector<uint8_t>>(bytes + offset), static_cast<int64_t>(offset),
+                      bytes, format, width, height, {}, {}, lms::DataSource::AUX_LUMA_RAW, {}};
+}
+
+}
+
+TEST(ValidYCbCr420, AcceptsAFrameWhosePlanesFit)
+{
+    EXPECT_TRUE(multisense_ros::valid_ycbcr420(plane(1920 * 1200, 40, lms::Image::PixelFormat::MONO8, 1920, 1200),
+                                               plane(1920 * 600, 40, lms::Image::PixelFormat::MONO16, 960, 600)));
+}
+
+TEST(ValidYCbCr420, RefusesAnythingTheConverterWouldReadOrWritePast)
+{
+    using F = lms::Image::PixelFormat;
+    const auto luma = plane(8 * 4, 0, F::MONO8, 8, 4);
+    const auto chroma = plane(8 * 2, 0, F::MONO16, 4, 2);
+    ASSERT_TRUE(multisense_ros::valid_ycbcr420(luma, chroma));
+
+    EXPECT_FALSE(multisense_ros::valid_ycbcr420(plane(7 * 4, 0, F::MONO8, 7, 4), chroma)) << "odd width";
+    EXPECT_FALSE(multisense_ros::valid_ycbcr420(plane(8 * 3, 0, F::MONO8, 8, 3), chroma)) << "odd height";
+    EXPECT_FALSE(multisense_ros::valid_ycbcr420(luma, plane(8 * 2, 0, F::MONO16, 3, 2))) << "chroma width";
+    EXPECT_FALSE(multisense_ros::valid_ycbcr420(luma, plane(8 * 2, 0, F::MONO16, 4, 1))) << "chroma height";
+    EXPECT_FALSE(multisense_ros::valid_ycbcr420(plane(8 * 4, 0, F::MONO16, 8, 4), chroma)) << "luma format";
+    EXPECT_FALSE(multisense_ros::valid_ycbcr420(luma, plane(8 * 2, 0, F::MONO8, 4, 2))) << "chroma format";
+    EXPECT_FALSE(multisense_ros::valid_ycbcr420(plane(0, 0, F::MONO8, 0, 0), plane(0, 0, F::MONO16, 0, 0)))
+        << "empty";
+
+    auto short_luma = luma;
+    short_luma.raw_data = std::make_shared<std::vector<uint8_t>>(8 * 4 - 1);
+    EXPECT_FALSE(multisense_ros::valid_ycbcr420(short_luma, chroma)) << "luma buffer short";
+    auto short_chroma = chroma;
+    short_chroma.image_data_offset = 1;
+    EXPECT_FALSE(multisense_ros::valid_ycbcr420(luma, short_chroma)) << "chroma offset past the end";
+    auto no_data = luma;
+    no_data.raw_data = nullptr;
+    EXPECT_FALSE(multisense_ros::valid_ycbcr420(no_data, chroma)) << "no buffer";
+    auto negative = luma;
+    negative.image_data_offset = -1;
+    EXPECT_FALSE(multisense_ros::valid_ycbcr420(negative, chroma)) << "negative offset";
+}

@@ -10,7 +10,16 @@
 #include <cstdint>
 #include <vector>
 
+#include <MultiSense/MultiSenseTypes.hh>
+
 namespace multisense_ros {
+
+///
+/// @brief True when luma (MONO8) and chroma (MONO16, half width and height) form a frame the
+///        converter and the JPEG encoder can read whole: even, non-zero sizes and buffers that
+///        hold both planes past their offsets
+///
+bool valid_ycbcr420(const multisense::Image &luma, const multisense::Image &chroma);
 
 class YCbCr420ToBgr
 {
@@ -24,7 +33,8 @@ public:
 
     ///
     /// @brief Convert one frame. luma is width x height MONO8, chroma width/2 x height/2
-    ///        interleaved Cb, Cr; out receives width x height x 3 bytes of BGR8.
+    ///        interleaved Cb, Cr; out receives width x height x 3 bytes of BGR8. width and
+    ///        height must be even (valid_ycbcr420).
     ///
     void operator()(const uint8_t *luma,
                     const uint8_t *chroma,
