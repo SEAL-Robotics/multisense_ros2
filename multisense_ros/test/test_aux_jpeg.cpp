@@ -324,3 +324,69 @@ TEST_F(Gst, ANewFrameSizeRetriesEveryCandidate)
     EXPECT_NE(encoder.encode(luma.data(), chroma.data(), W / 2, H / 2), nullptr);
     EXPECT_EQ(warnings.size(), 2u);
 }
+
+TEST_F(Gst, AnEncoderWedgedAfterDeliveringIsRebuilt)
+{
+    // Delivers, then stops answering: past the limit the pipeline is torn down and started again.
+    std::vector<std::string> warnings;
+    auto options = quick();
+    options.first_frame_timeout = std::chrono::milliseconds{3000};
+    options.failures_before_restart = 5;
+    JpegEncoder encoder{"test", {{"stalled", "identity sleep-time=1000000 ! jpegenc"}}, options,
+                        [&](const std::string &w) { warnings.push_back(w); }};
+    std::vector<uint8_t> luma(W * H, 90), chroma(W * H / 2, 128);
+    ASSERT_NE(encoder.encode(luma.data(), chroma.data(), W, H), nullptr);
+    for (int i = 0; i < 5; ++i)
+    {
+        encoder.encode(luma.data(), chroma.data(), W, H);
+    }
+    ASSERT_EQ(warnings.size(), 1u);
+    EXPECT_NE(warnings[0].find("restart"), std::string::npos) << warnings[0];
+}
+
+TEST_F(Gst, EncodersThatWillNotStartAreRetriedOnATimerNotEveryFrame)
+{
+    std::vector<std::string> warnings;
+    auto options = quick();
+    options.start_retry = std::chrono::milliseconds{300};
+    JpegEncoder encoder{"test", {{"broken", "jpegenc no_such_property=1"}}, options,
+                        [&](const std::string &w) { warnings.push_back(w); }};
+    std::vector<uint8_t> luma(W * H, 90), chroma(W * H / 2, 128);
+    for (int i = 0; i < 20; ++i)
+    {
+        EXPECT_EQ(encoder.encode(luma.data(), chroma.data(), W, H), nullptr);
+    }
+    EXPECT_EQ(warnings.size(), 1u);
+    std::this_thread::sleep_for(std::chrono::milliseconds{400});
+    encoder.encode(luma.data(), chroma.data(), W, H);
+    EXPECT_EQ(warnings.size(), 2u);
+    // A new frame size is tried at once.
+    encoder.encode(luma.data(), chroma.data(), W / 2, H / 2);
+    EXPECT_EQ(warnings.size(), 3u);
+}
+
+TEST_F(Gst, AWidthWhoseChromaRowIsNotFourBytesEncodesTheRightPicture)
+{
+    // GStreamer pads I420 rows to 4 bytes: at 644 wide the chroma rows are 322 bytes of data
+    // in 324. Packed planes would shear the colour.
+    constexpr int w = 644;
+    constexpr int h = 200;
+    std::vector<uint8_t> luma(w * h), chroma(w * h / 2);
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x)
+            luma[y * w + x] = static_cast<uint8_t>(40 + (x * 150) / w);
+    for (int y = 0; y < h / 2; ++y)
+        for (int x = 0; x < w / 2; ++x)
+        {
+            chroma[2 * (y * w / 2 + x)] = static_cast<uint8_t>(x < w / 4 ? 90 : 170);
+            chroma[2 * (y * w / 2 + x) + 1] = static_cast<uint8_t>(y < h / 4 ? 90 : 170);
+        }
+    cv::Mat raw(h, w, CV_8UC3);
+    YCbCr420ToBgr{}(luma.data(), chroma.data(), w, h, raw.data);
+    JpegEncoder encoder{"test", 90, std::vector<std::string>{"jpegenc"}};
+    const auto jpeg = encoder.encode(luma.data(), chroma.data(), w, h);
+    ASSERT_NE(jpeg, nullptr);
+    const cv::Mat decoded = cv::imdecode(*jpeg, cv::IMREAD_COLOR);
+    ASSERT_EQ(decoded.cols, w);
+    EXPECT_GT(cv::PSNR(decoded, raw), 30.0);
+}

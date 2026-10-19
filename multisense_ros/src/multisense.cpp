@@ -1050,6 +1050,10 @@ void MultiSense::initialize_stereo_publishers(const multisense::MultiSenseConfig
                 [this](std::vector<uint8_t> jpeg, const builtin_interfaces::msg::Time &stamp)
                 {
                     aux_rect_jpeg_pub_->publish(make_aux_jpeg_message(std::move(jpeg), frame_id_rectified_aux_, stamp));
+                },
+                [this](const std::string &error)
+                {
+                    RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 5000, "MultiSense: %s", error.c_str());
                 });
         }
 
@@ -1165,7 +1169,6 @@ MultiSense::~MultiSense()
     // Shutdown all our publishing threads
 
     shutdown_ = true;
-    aux_jpeg_worker_.reset();
     if (thermal_publisher_)
     {
         thermal_publisher_->shutdown();
@@ -1178,6 +1181,9 @@ MultiSense::~MultiSense()
     {
         thread.join();
     }
+
+    // Only now: color_publisher() posts to it until its thread has been joined.
+    aux_jpeg_worker_.reset();
 }
 
 std::optional<std::chrono::nanoseconds> MultiSense::time_since_last_response() const

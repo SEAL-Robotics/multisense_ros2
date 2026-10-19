@@ -36,7 +36,8 @@ find_package(tf2_ros REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
 find_package(PkgConfig)
 if(PkgConfig_FOUND)
-  pkg_check_modules(GST IMPORTED_TARGET gstreamer-1.0 gstreamer-app-1.0 gstreamer-video-1.0)
+  # 1.20 for appsrc's leaky-type, which bounds the aux JPEG encoder's input queue.
+  pkg_check_modules(GST IMPORTED_TARGET gstreamer-1.0>=1.20 gstreamer-app-1.0>=1.20 gstreamer-video-1.0>=1.20)
 endif()
 
 include_directories(include)

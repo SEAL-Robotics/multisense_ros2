@@ -70,6 +70,12 @@ const JfifChromaTables &jfif_chroma_tables();
 ///
 void fill_i420(const uint8_t *luma, const uint8_t *chroma, int width, int height, uint8_t *dst);
 
+///
+/// @brief The same into planes with their own row strides, as GStreamer lays I420 out
+///
+void fill_i420(const uint8_t *luma, const uint8_t *chroma, int width, int height,
+               uint8_t *y, size_t y_stride, uint8_t *cb, size_t cb_stride, uint8_t *cr, size_t cr_stride);
+
 std::unique_ptr<sensor_msgs::msg::CompressedImage> make_aux_jpeg_message(
     std::vector<uint8_t> jpeg,
     const std::string &frame_id,
@@ -106,6 +112,10 @@ struct JpegEncoderOptions
     int misses_before_fallback = 3;
     // Frames waiting for the encoder at most; a full queue drops its oldest frame.
     size_t max_queued_frames = 2;
+    // Frames in a row with no JPEG, after a first one, that tear the pipeline down and start it again.
+    int failures_before_restart = 10;
+    // When no candidate will start, how long before trying them all again.
+    std::chrono::milliseconds start_retry{5000};
 };
 
 using WarningSink = std::function<void(const std::string &)>;
@@ -172,6 +182,7 @@ private:
     struct Pipeline;
     bool start(size_t candidate, int width, int height);
     void fall_back(const std::string &why);
+    void note_failure();
 
     std::string name_;
     JpegEncoderOptions options_;
@@ -181,6 +192,7 @@ private:
     std::unique_ptr<Pipeline> pipeline_;
     int width_ = 0;
     int height_ = 0;
+    std::chrono::steady_clock::time_point retry_after_{};
 };
 
 ///
@@ -206,8 +218,13 @@ class AuxJpegWorker
 public:
     using Encode = std::function<std::shared_ptr<std::vector<uint8_t>>(const AuxJpegJob &)>;
     using Publish = std::function<void(std::vector<uint8_t>, const builtin_interfaces::msg::Time &)>;
+    using Error = std::function<void(const std::string &)>;
 
-    AuxJpegWorker(Encode encode, Publish publish);
+    ///
+    /// @brief error hears whatever encode or publish throws; the frame is dropped and the
+    ///        worker carries on
+    ///
+    AuxJpegWorker(Encode encode, Publish publish, Error error = nullptr);
     ~AuxJpegWorker();
 
     AuxJpegWorker(const AuxJpegWorker&) = delete;
@@ -228,6 +245,7 @@ private:
 
     Encode encode_;
     Publish publish_;
+    Error error_;
     std::mutex mutex_;
     std::condition_variable wake_;
     std::condition_variable idle_;

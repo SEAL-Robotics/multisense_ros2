@@ -118,3 +118,38 @@ TEST(AuxJpegWorker, StopsWithAFramePending)
     worker.reset();   // must return, not hang on the pending frame
     SUCCEED();
 }
+
+TEST(AuxJpegWorker, AThrowingEncoderOrPublisherIsLoggedAndTheWorkerCarriesOn)
+{
+    std::vector<std::string> errors;
+    int published = 0;
+    int calls = 0;
+    AuxJpegWorker worker{
+        [&](const AuxJpegJob &) -> std::shared_ptr<std::vector<uint8_t>>
+        {
+            if (++calls == 1)
+            {
+                throw std::runtime_error("encoder exploded");
+            }
+            return std::make_shared<std::vector<uint8_t>>(std::vector<uint8_t>{0xFF, 0xD8});
+        },
+        [&](std::vector<uint8_t>, const builtin_interfaces::msg::Time &stamp)
+        {
+            if (stamp.sec == 2)
+            {
+                throw std::runtime_error("publisher exploded");
+            }
+            ++published;
+        },
+        [&](const std::string &e) { errors.push_back(e); }};
+    worker.post(job(1));
+    worker.wait_idle();
+    worker.post(job(2));
+    worker.wait_idle();
+    worker.post(job(3));
+    worker.wait_idle();
+    EXPECT_EQ(published, 1);
+    ASSERT_EQ(errors.size(), 2u);
+    EXPECT_NE(errors[0].find("encoder exploded"), std::string::npos);
+    EXPECT_NE(errors[1].find("publisher exploded"), std::string::npos);
+}

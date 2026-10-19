@@ -12,6 +12,7 @@
 #include <gst/app/gstappsink.h>
 #include <gst/app/gstappsrc.h>
 #include <gst/gst.h>
+#include <gst/video/video.h>
 #endif
 
 namespace multisense_ros {
@@ -43,15 +44,30 @@ const JfifChromaTables &jfif_chroma_tables()
 
 void fill_i420(const uint8_t *luma, const uint8_t *chroma, int width, int height, uint8_t *dst)
 {
-    const auto &lut = jfif_chroma_tables();
     const size_t pixels = static_cast<size_t>(width) * height;
-    std::copy(luma, luma + pixels, dst);
-    uint8_t *cb = dst + pixels;
-    uint8_t *cr = cb + pixels / 4;
-    for (size_t i = 0; i < pixels / 4; ++i)
+    fill_i420(luma, chroma, width, height, dst, width, dst + pixels, width / 2,
+              dst + pixels + pixels / 4, width / 2);
+}
+
+void fill_i420(const uint8_t *luma, const uint8_t *chroma, int width, int height,
+               uint8_t *y, size_t y_stride, uint8_t *cb, size_t cb_stride, uint8_t *cr, size_t cr_stride)
+{
+    const auto &lut = jfif_chroma_tables();
+    const size_t w = static_cast<size_t>(width);
+    for (size_t row = 0; row < static_cast<size_t>(height); ++row)
     {
-        cb[i] = lut.cb[chroma[2 * i]];
-        cr[i] = lut.cr[chroma[2 * i + 1]];
+        std::copy(luma + row * w, luma + (row + 1) * w, y + row * y_stride);
+    }
+    for (size_t row = 0; row < static_cast<size_t>(height) / 2; ++row)
+    {
+        const uint8_t *c = chroma + row * w;   // w / 2 Cb, Cr pairs
+        uint8_t *b = cb + row * cb_stride;
+        uint8_t *r = cr + row * cr_stride;
+        for (size_t col = 0; col < w / 2; ++col)
+        {
+            b[col] = lut.cb[c[2 * col]];
+            r[col] = lut.cr[c[2 * col + 1]];
+        }
     }
 }
 
@@ -68,9 +84,10 @@ std::unique_ptr<sensor_msgs::msg::CompressedImage> make_aux_jpeg_message(
     return msg;
 }
 
-AuxJpegWorker::AuxJpegWorker(Encode encode, Publish publish):
+AuxJpegWorker::AuxJpegWorker(Encode encode, Publish publish, Error error):
     encode_(std::move(encode)),
     publish_(std::move(publish)),
+    error_(std::move(error)),
     thread_(&AuxJpegWorker::run, this)
 {
 }
@@ -117,9 +134,21 @@ void AuxJpegWorker::run()
             pending_.reset();
             busy_ = true;
         }
-        if (auto jpeg = encode_(job))
+        // Escaping this thread would terminate the driver.
+        try
         {
-            publish_(std::move(*jpeg), job.stamp);
+            if (auto jpeg = encode_(job))
+            {
+                publish_(std::move(*jpeg), job.stamp);
+            }
+        }
+        catch (const std::exception &e)
+        {
+            if (error_) error_(std::string{"aux JPEG frame dropped: "} + e.what());
+        }
+        catch (...)
+        {
+            if (error_) error_("aux JPEG frame dropped: unknown exception");
         }
         {
             std::lock_guard<std::mutex> lock{mutex_};
@@ -213,9 +242,11 @@ struct JpegEncoder::Pipeline
     GstElement *src = nullptr;
     GstElement *sink = nullptr;
     GstBufferPool *pool = nullptr;
+    GstVideoInfo info{};
     guint64 frame_count = 0;
     uint64_t in_flight = 0;
     int misses = 0;
+    int failures = 0;
     bool last_missed = false;
     bool delivered = false;
 
@@ -320,10 +351,13 @@ bool JpegEncoder::start(size_t candidate, int width, int height)
         g_object_set(pipeline->src, "max-buffers", static_cast<guint64>(options_.max_queued_frames),
                      "leaky-type", GST_APP_LEAKY_TYPE_DOWNSTREAM, nullptr);
     }
+    // GStreamer pads each I420 row to 4 bytes, so a frame is laid out by its video info, not packed.
+    gst_video_info_set_format(&pipeline->info, GST_VIDEO_FORMAT_I420, static_cast<guint>(width),
+                              static_cast<guint>(height));
     GstCaps *pool_caps = gst_caps_from_string(caps.c_str());
     pipeline->pool = gst_buffer_pool_new();
     GstStructure *config = gst_buffer_pool_get_config(pipeline->pool);
-    gst_buffer_pool_config_set_params(config, pool_caps, static_cast<guint>(width) * height * 3 / 2, 0,
+    gst_buffer_pool_config_set_params(config, pool_caps, static_cast<guint>(GST_VIDEO_INFO_SIZE(&pipeline->info)), 0,
                                       static_cast<guint>(options_.max_queued_frames + 2));
     gst_caps_unref(pool_caps);
     if (!gst_buffer_pool_set_config(pipeline->pool, config) ||
@@ -343,12 +377,35 @@ void JpegEncoder::fall_back(const std::string &why)
     const std::string from = candidates_[current_].element;
     pipeline_.reset();
     ++current_;
+    if (current_ >= candidates_.size())
+    {
+        // None will start: wait before trying them all again rather than on every frame.
+        current_ = 0;
+        retry_after_ = std::chrono::steady_clock::now() + options_.start_retry;
+    }
     if (warn_)
     {
         warn_("JPEG encoder " + name_ + ": " + from + " " + why +
-              (current_ < candidates_.size() ? "; falling back to " + candidates_[current_].element
-                                             : "; no encoder left"));
+              (current_ > 0 ? "; falling back to " + candidates_[current_].element
+                            : "; no encoder left, retrying in " +
+                                  std::to_string(options_.start_retry.count()) + " ms"));
     }
+}
+
+void JpegEncoder::note_failure()
+{
+    // An encoder that has delivered and then stops (a wedged NVJPG, a pool it never returns)
+    // would otherwise drop every frame from here on.
+    if (!pipeline_ || !pipeline_->delivered || ++pipeline_->failures < options_.failures_before_restart)
+    {
+        return;
+    }
+    if (warn_)
+    {
+        warn_("JPEG encoder " + name_ + ": " + candidates_[current_].element + " gave no JPEG in " +
+              std::to_string(pipeline_->failures) + " frames; restarting it");
+    }
+    pipeline_.reset();
 }
 
 std::shared_ptr<std::vector<uint8_t>> JpegEncoder::encode(const uint8_t *luma,
@@ -361,20 +418,26 @@ std::shared_ptr<std::vector<uint8_t>> JpegEncoder::encode(const uint8_t *luma,
         // A new mode may suit the preferred encoder that an earlier one did not.
         pipeline_.reset();
         current_ = 0;
+        retry_after_ = {};
         width_ = width;
         height_ = height;
     }
-    while (!pipeline_ && current_ < candidates_.size() && !start(current_, width, height))
+    if (!pipeline_ && std::chrono::steady_clock::now() < retry_after_)
     {
-        fall_back("did not start");
-    }
-    if (!pipeline_)
-    {
-        if (current_ >= candidates_.size())
-        {
-            current_ = candidates_.size() - 1;
-        }
         return nullptr;
+    }
+    while (!pipeline_)
+    {
+        const size_t trying = current_;
+        if (start(trying, width, height))
+        {
+            break;
+        }
+        fall_back("did not start");
+        if (current_ == 0)
+        {
+            return nullptr;
+        }
     }
     Pipeline &p = *pipeline_;
 
@@ -391,6 +454,7 @@ std::shared_ptr<std::vector<uint8_t>> JpegEncoder::encode(const uint8_t *luma,
     if (gst_buffer_pool_acquire_buffer(p.pool, &buffer, &params) != GST_FLOW_OK)
     {
         // Every pooled frame is still with the encoder: it is behind, so this frame is dropped.
+        note_failure();
         return nullptr;
     }
     GstMapInfo map;
@@ -399,7 +463,11 @@ std::shared_ptr<std::vector<uint8_t>> JpegEncoder::encode(const uint8_t *luma,
         gst_buffer_unref(buffer);
         return nullptr;
     }
-    fill_i420(luma, chroma, width, height, map.data);
+    const GstVideoInfo &info = p.info;
+    fill_i420(luma, chroma, width, height,
+              map.data + GST_VIDEO_INFO_PLANE_OFFSET(&info, 0), GST_VIDEO_INFO_PLANE_STRIDE(&info, 0),
+              map.data + GST_VIDEO_INFO_PLANE_OFFSET(&info, 1), GST_VIDEO_INFO_PLANE_STRIDE(&info, 1),
+              map.data + GST_VIDEO_INFO_PLANE_OFFSET(&info, 2), GST_VIDEO_INFO_PLANE_STRIDE(&info, 2));
     gst_buffer_unmap(buffer, &map);
 
     const GstClockTime pts = p.frame_count++ * GST_MSECOND;
@@ -436,7 +504,9 @@ std::shared_ptr<std::vector<uint8_t>> JpegEncoder::encode(const uint8_t *luma,
             current_ + 1 < candidates_.size())
         {
             fall_back("delivered no frame in " + std::to_string(p.misses) + " tries");
+            return nullptr;
         }
+        note_failure();
         return nullptr;
     }
 
@@ -449,6 +519,7 @@ std::shared_ptr<std::vector<uint8_t>> JpegEncoder::encode(const uint8_t *luma,
             out = std::make_shared<std::vector<uint8_t>>(jpeg.data, jpeg.data + jpeg.size);
             p.delivered = true;
             p.misses = 0;
+            p.failures = 0;
         }
         gst_buffer_unmap(gst_sample_get_buffer(sample), &jpeg);
     }
@@ -493,6 +564,10 @@ bool JpegEncoder::start(size_t, int, int)
 }
 
 void JpegEncoder::fall_back(const std::string &)
+{
+}
+
+void JpegEncoder::note_failure()
 {
 }
 
