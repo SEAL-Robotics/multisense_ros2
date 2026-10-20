@@ -38,8 +38,8 @@ initialization:
       default_value: false
       read_only: true
       description: "Publish aux/image_rect_color/compressed, a JPEG encoded from the aux camera's own
-                     YCbCr planes (NVJPG on a Jetson, else libjpeg), only while it has a subscriber.
-                     Needs a build with GStreamer"
+                     YCbCr planes, only while it has a subscriber: on NVJPG in a build with the
+                     Jetson Multimedia API, with libjpeg-turbo where NVJPG is absent or fails"
   aux_jpeg_quality:
       type: int
       default_value: 75

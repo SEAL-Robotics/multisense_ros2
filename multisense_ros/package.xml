@@ -21,6 +21,7 @@
   <build_depend>libgstreamer1.0-dev</build_depend>
   <build_depend>libgstreamer-plugins-base1.0-dev</build_depend>
   <build_depend>libopencv-dev</build_depend>
+  <depend>libjpeg</depend>
   <build_depend>image_geometry</build_depend>
   <build_depend>image_transport</build_depend>
   <build_depend>multisense_lib</build_depend>
@@ -41,8 +42,6 @@
   <exec_depend>image_transport</exec_depend>
   <exec_depend>gstreamer1.0-libav</exec_depend>
   <exec_depend>gstreamer1.0-plugins-bad</exec_depend>
-  <!-- jpegenc, the CPU encoder of aux/image_rect_color/compressed where nvjpegenc is absent -->
-  <exec_depend>gstreamer1.0-plugins-good</exec_depend>
   <exec_depend>libopencv-dev</exec_depend>
   <exec_depend>multisense_lib</exec_depend>
   <exec_depend>multisense_msgs</exec_depend>

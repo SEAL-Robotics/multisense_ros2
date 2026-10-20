@@ -9,7 +9,6 @@
 #pragma once
 
 #include <array>
-#include <chrono>
 #include <condition_variable>
 #include <functional>
 #include <mutex>
@@ -71,7 +70,7 @@ const JfifChromaTables &jfif_chroma_tables();
 void fill_i420(const uint8_t *luma, const uint8_t *chroma, int width, int height, uint8_t *dst);
 
 ///
-/// @brief The same into planes with their own row strides, as GStreamer lays I420 out
+/// @brief The same into planes with their own row strides
 ///
 void fill_i420(const uint8_t *luma, const uint8_t *chroma, int width, int height,
                uint8_t *y, size_t y_stride, uint8_t *cb, size_t cb_stride, uint8_t *cr, size_t cr_stride);
@@ -82,86 +81,102 @@ std::unique_ptr<sensor_msgs::msg::CompressedImage> make_aux_jpeg_message(
     const builtin_interfaces::msg::Time &stamp);
 
 ///
-/// @brief Whether a sample the encoder hands back is the frame just pushed. An encoder that
-///        keeps timestamps is matched on them; one that drops them (sample_pts empty) can
-///        only be matched when that frame is the only one out.
+/// @brief JPEG from the camera's planes on libjpeg-turbo, the libjpeg the driver already has
+///        loaded through OpenCV, on the CPU
 ///
-inline bool accept_sample(std::optional<uint64_t> sample_pts, uint64_t pushed_pts, uint64_t in_flight)
-{
-    return sample_pts ? *sample_pts == pushed_pts : in_flight == 1;
-}
-
-///
-/// @brief A GStreamer encoder to try: element names it for logs, description is the pipeline
-///        fragment between appsrc (I420) and appsink (image/jpeg).
-///
-struct EncoderCandidate
-{
-    std::string element;
-    std::string description;
-};
-
-struct JpegEncoderOptions
-{
-    // NVJPG and CUDA set up on the first frame, which can take a second or more.
-    std::chrono::milliseconds first_frame_timeout{2000};
-    std::chrono::milliseconds frame_timeout{200};
-    // Short after a miss, so a failing encoder does not hold up the frames behind it.
-    std::chrono::milliseconds timeout_after_miss{20};
-    // Misses before a first delivery that give up a candidate for the next one.
-    int misses_before_fallback = 3;
-    // Frames waiting for the encoder at most; a full queue drops its oldest frame.
-    size_t max_queued_frames = 2;
-    // Frames in a row with no JPEG, after a first one, that tear the pipeline down and start it again.
-    int failures_before_restart = 10;
-    // When no candidate will start, how long before trying them all again.
-    std::chrono::milliseconds start_retry{5000};
-};
-
-using WarningSink = std::function<void(const std::string &)>;
-
 class JpegEncoder
 {
 public:
     ///
-    /// @brief True when this build can encode JPEG (it was compiled against GStreamer)
+    /// @brief quality 1-100; throws std::invalid_argument outside it
     ///
-    static bool available();
+    explicit JpegEncoder(int quality);
 
     ///
-    /// @brief True when the GStreamer element exists in this installation
+    /// @brief Encode one frame: full-size luma and half-size interleaved CbCr on the camera's
+    ///        scale, width and height even. Throws std::invalid_argument for any other size
+    ///        and std::runtime_error when libjpeg fails.
     ///
-    static bool has_encoder(const std::string &element);
+    std::shared_ptr<std::vector<uint8_t>> encode(const uint8_t *luma,
+                                                 const uint8_t *chroma,
+                                                 int width,
+                                                 int height);
+
+    int quality() const { return quality_; }
+
+private:
+    int quality_;
+    // Y, Cb and Cr padded out to whole MCUs, which libjpeg's raw input reads.
+    std::vector<uint8_t> planes_;
+};
+
+///
+/// @brief JPEG on NVJPG, the Jetson's JPEG engine. Its library, libnvmm_jpeg, exports the
+///        libjpeg names at libjpeg 9's ABI, so it is opened local to this class and reached
+///        only through its own symbols. Linked normally, or loaded by GStreamer's nvjpegenc,
+///        its callers bind to the driver's libjpeg-turbo instead ("JPEG parameter struct
+///        mismatch") and the driver dies.
+///
+class NvJpegEncoder
+{
+public:
+    ///
+    /// @brief An encoder for frames of one size, or nullptr with error set where this build
+    ///        or this host has no NVJPG
+    ///
+    static std::unique_ptr<NvJpegEncoder> create(int quality, int width, int height, std::string *error);
+
+    ~NvJpegEncoder();
+
+    NvJpegEncoder(const NvJpegEncoder&) = delete;
+    NvJpegEncoder& operator=(const NvJpegEncoder&) = delete;
 
     ///
-    /// @brief nvjpegenc (the Jetson's NVJPG engine), then jpegenc (libjpeg on the CPU), those
-    ///        of them installed here, at quality 1-100. Empty when neither is.
+    /// @brief As JpegEncoder::encode, at the size it was created for. Throws
+    ///        std::runtime_error when NVJPG fails.
     ///
-    static std::vector<EncoderCandidate> default_candidates(int quality);
+    std::shared_ptr<std::vector<uint8_t>> encode(const uint8_t *luma,
+                                                 const uint8_t *chroma,
+                                                 int width,
+                                                 int height);
 
-    JpegEncoder(const std::string &name, int quality);
+private:
+    struct Impl;
+    explicit NvJpegEncoder(std::unique_ptr<Impl> impl);
+    std::unique_ptr<Impl> impl_;
+};
+
+using JpegFrameEncoder = std::function<std::shared_ptr<std::vector<uint8_t>>(
+    const uint8_t *luma, const uint8_t *chroma, int width, int height)>;
+using WarningSink = std::function<void(const std::string &)>;
+
+///
+/// @brief The aux JPEG encoder the driver runs: a hardware encoder while it works,
+///        libjpeg-turbo otherwise. A hardware encoder that does not start, throws, returns
+///        something not a whole JPEG, or whose JPEG of a check frame does not decode to the
+///        picture libjpeg-turbo's does is given up for good, with one warning, and that frame
+///        is encoded on the CPU instead.
+///
+class AuxJpegEncoder
+{
+public:
+    ///
+    /// @brief Makes the hardware encoder for frames of one size, or returns empty with error set
+    ///
+    using HardwareFactory = std::function<JpegFrameEncoder(int width, int height, std::string *error)>;
 
     ///
-    /// @brief The named elements, in order, at quality 1-100
+    /// @brief NVJPG, through NvJpegEncoder
     ///
-    JpegEncoder(const std::string &name, int quality, const std::vector<std::string> &elements);
+    static HardwareFactory nvjpg(int quality);
 
     ///
-    /// @brief The installed ones of candidates, in order. warn hears each fallback.
-    ///        Throws when none is installed.
+    /// @brief quality 1-100; an empty hardware encodes on libjpeg-turbo alone
     ///
-    JpegEncoder(const std::string &name,
-                std::vector<EncoderCandidate> candidates,
-                JpegEncoderOptions options,
-                WarningSink warn);
-    ~JpegEncoder();
-
-    JpegEncoder(const JpegEncoder&) = delete;
-    JpegEncoder& operator=(const JpegEncoder&) = delete;
+    AuxJpegEncoder(int quality, HardwareFactory hardware, std::string hardware_name, WarningSink warn);
 
     ///
-    /// @brief Encode one frame from the camera's planes. Returns nullptr when no JPEG of
-    ///        this frame came out in time, or the encoder is still busy with earlier ones.
+    /// @brief As JpegEncoder::encode, on whichever encoder is current
     ///
     std::shared_ptr<std::vector<uint8_t>> encode(const uint8_t *luma,
                                                  const uint8_t *chroma,
@@ -169,31 +184,34 @@ public:
                                                  int height);
 
     ///
-    /// @brief The GStreamer element doing the encode, for logging
+    /// @brief The encoder the last JPEG came from: the hardware's name or "libjpeg-turbo"
     ///
-    const std::string &encoder_element() const;
-
-    ///
-    /// @brief Frames waiting in front of the encoder now
-    ///
-    size_t queued_frames() const;
+    const std::string &encoder_name() const { return encoder_name_; }
 
 private:
-    struct Pipeline;
-    bool start(size_t candidate, int width, int height);
-    void fall_back(const std::string &why);
-    void note_failure();
+    std::shared_ptr<std::vector<uint8_t>> encode_on_hardware(const uint8_t *luma,
+                                                             const uint8_t *chroma,
+                                                             int width,
+                                                             int height);
+    void give_up_hardware(const std::string &why);
+    // Empty when the hardware encodes a check frame as libjpeg-turbo does, else why not
+    std::string check_hardware(const JpegFrameEncoder &hardware, int width, int height);
 
-    std::string name_;
-    JpegEncoderOptions options_;
+    JpegEncoder cpu_;
+    HardwareFactory factory_;
+    std::string hardware_name_;
     WarningSink warn_;
-    std::vector<EncoderCandidate> candidates_;
-    size_t current_ = 0;
-    std::unique_ptr<Pipeline> pipeline_;
+    JpegFrameEncoder hardware_;
     int width_ = 0;
     int height_ = 0;
-    std::chrono::steady_clock::time_point retry_after_{};
+    std::string encoder_name_;
 };
+
+///
+/// @brief PSNR in dB between two JPEGs' decoded pictures; 0 when either does not decode
+///        or their sizes differ
+///
+double decoded_psnr(const std::vector<uint8_t> &a, const std::vector<uint8_t> &b);
 
 ///
 /// @brief One frame for the aux JPEG worker: the camera's planes, kept alive by their buffers

@@ -27,6 +27,8 @@ find_package(multisense_lib REQUIRED)
 find_package(MultiSense REQUIRED)
 find_package(multisense_msgs REQUIRED)
 find_package(OpenCV REQUIRED)
+# libjpeg-turbo, the libjpeg OpenCV loads: the process's global jpeg_* names stay one ABI.
+find_package(JPEG REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(ros_environment REQUIRED)
 find_package(sensor_msgs REQUIRED)
@@ -36,8 +38,7 @@ find_package(tf2_ros REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
 find_package(PkgConfig)
 if(PkgConfig_FOUND)
-  # 1.20 for appsrc's leaky-type, which bounds the aux JPEG encoder's input queue.
-  pkg_check_modules(GST IMPORTED_TARGET gstreamer-1.0>=1.20 gstreamer-app-1.0>=1.20 gstreamer-video-1.0>=1.20)
+  pkg_check_modules(GST IMPORTED_TARGET gstreamer-1.0 gstreamer-app-1.0 gstreamer-video-1.0)
 endif()
 
 include_directories(include)
@@ -60,6 +61,33 @@ if(GST_FOUND)
   target_compile_definitions(${PROJECT_NAME} PRIVATE MULTISENSE_ROS_HAVE_GSTREAMER)
 else()
   message(WARNING "GStreamer not found: multisense_ros builds without h264_images support")
+endif()
+
+target_link_libraries(${PROJECT_NAME} PRIVATE JPEG::JPEG)
+
+# NVJPG for aux/image_rect_color/compressed where the Jetson Multimedia API is installed;
+# libjpeg-turbo alone elsewhere, and as the fallback where NVJPG fails.
+set(MULTISENSE_MMAPI_DIR /usr/src/jetson_multimedia_api)
+# The headers must be the ones libnvmm_jpeg was built with: refuse to guess between several.
+file(GLOB MULTISENSE_MMAPI_LIBJPEG_DIR LIST_DIRECTORIES true ${MULTISENSE_MMAPI_DIR}/include/libjpeg-*)
+list(LENGTH MULTISENSE_MMAPI_LIBJPEG_DIR MULTISENSE_MMAPI_LIBJPEG_DIRS)
+find_library(MULTISENSE_NVBUFSURFACE_LIBRARY nvbufsurface
+             PATHS /usr/lib/aarch64-linux-gnu/nvidia /usr/lib/aarch64-linux-gnu/tegra NO_DEFAULT_PATH)
+if(MULTISENSE_MMAPI_LIBJPEG_DIRS GREATER 1)
+  message(WARNING "multisense_ros: several Multimedia API libjpeg headers (${MULTISENSE_MMAPI_LIBJPEG_DIR}): "
+                  "aux JPEG on libjpeg-turbo only")
+elseif(EXISTS ${MULTISENSE_MMAPI_DIR}/include/nvbufsurface.h AND MULTISENSE_MMAPI_LIBJPEG_DIRS EQUAL 1
+       AND MULTISENSE_NVBUFSURFACE_LIBRARY)
+  target_sources(${PROJECT_NAME} PRIVATE src/nv_jpeg.cpp)
+  # The Multimedia API's libjpeg headers for this file alone: every other file sees libjpeg-turbo's.
+  set_source_files_properties(src/nv_jpeg.cpp PROPERTIES
+      INCLUDE_DIRECTORIES "${MULTISENSE_MMAPI_DIR}/include;${MULTISENSE_MMAPI_LIBJPEG_DIR}")
+  target_compile_definitions(${PROJECT_NAME} PRIVATE MULTISENSE_ROS_HAVE_NVJPG)
+  # libnvmm_jpeg itself is opened at run time; nv_jpeg.cpp says why.
+  target_link_libraries(${PROJECT_NAME} PRIVATE ${MULTISENSE_NVBUFSURFACE_LIBRARY} ${CMAKE_DL_LIBS})
+  message(STATUS "multisense_ros: aux JPEG on NVJPG, libjpeg-turbo where it fails")
+else()
+  message(STATUS "multisense_ros: no Jetson Multimedia API: aux JPEG on libjpeg-turbo")
 endif()
 
 target_link_libraries(${PROJECT_NAME} PUBLIC
@@ -143,6 +171,11 @@ if(BUILD_TESTING)
   target_link_libraries(test_aux_jpeg ${PROJECT_NAME})
   ament_add_gtest(test_aux_jpeg_worker test/test_aux_jpeg_worker.cpp)
   target_link_libraries(test_aux_jpeg_worker ${PROJECT_NAME})
+  # Starts nodes: kept off the robot's DDS domains.
+  ament_add_gtest(test_aux_jpeg_topic test/test_aux_jpeg_topic.cpp TIMEOUT 60
+      ENV ROS_DOMAIN_ID=97 ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST ROS_STATIC_PEERS= ROS_LOCALHOST_ONLY=
+          CYCLONEDDS_URI= DDS_LOCAL_IP=)
+  target_link_libraries(test_aux_jpeg_topic ${PROJECT_NAME})
 endif()
 
 ament_export_targets(multisense_ros-targets HAS_LIBRARY_TARGET)
@@ -155,6 +188,7 @@ ament_export_dependencies(
   generate_parameter_library
   image_geometry
   image_transport
+  JPEG
   MultiSense
   multisense_lib
   multisense_msgs

@@ -740,20 +740,10 @@ MultiSense::MultiSense(const std::string& node_name,
 
     aux_jpeg_ = aux_jpeg;
     aux_jpeg_quality_ = aux_jpeg_quality;
-    if (aux_jpeg_ && !JpegEncoder::available())
-    {
-        throw std::runtime_error("aux_jpeg is set but multisense_ros was built without GStreamer");
-    }
     if (aux_jpeg_ && use_image_transport)
     {
         // image_transport would advertise the same <topic>/compressed name itself.
         throw std::runtime_error("aux_jpeg and use_image_transport both publish image_rect_color/compressed");
-    }
-    if (aux_jpeg_ && JpegEncoder::default_candidates(aux_jpeg_quality_).empty())
-    {
-        // Advertising the topic with nothing to encode it would leave Howler waiting silently.
-        throw std::runtime_error("aux_jpeg is set but neither nvjpegenc nor jpegenc is installed "
-                                 "(install gstreamer1.0-plugins-good)");
     }
 
     //
@@ -1004,46 +994,23 @@ void MultiSense::initialize_stereo_publishers(const multisense::MultiSenseConfig
                 RECT_COLOR_JPEG_TOPIC, aux_jpeg_qos(),
                 create_publisher_options({ds::AUX_RECTIFIED_RAW}, get_full_topic_name(aux_node_, RECT_COLOR_JPEG_TOPIC)));
 
-            std::string encoders;
-            for (const auto &candidate : JpegEncoder::default_candidates(aux_jpeg_quality_))
-            {
-                encoders += (encoders.empty() ? "" : ", then ") + candidate.element;
-            }
-            RCLCPP_INFO(get_logger(), "MultiSense: aux/image_rect_color/compressed at JPEG quality %d with %s",
-                        aux_jpeg_quality_, encoders.c_str());
+            aux_jpeg_encoder_ = std::make_unique<AuxJpegEncoder>(
+                aux_jpeg_quality_, AuxJpegEncoder::nvjpg(aux_jpeg_quality_), "NVJPG",
+                [this](const std::string &warning) { RCLCPP_WARN(get_logger(), "MultiSense: %s", warning.c_str()); });
+            RCLCPP_INFO(get_logger(), "MultiSense: aux/image_rect_color/compressed at JPEG quality %d, "
+                        "NVJPG where it works, else libjpeg-turbo", aux_jpeg_quality_);
 
             aux_jpeg_worker_ = std::make_unique<AuxJpegWorker>(
-                [this](const AuxJpegJob &job) -> std::shared_ptr<std::vector<uint8_t>>
+                [this](const AuxJpegJob &job)
                 {
-                    if (!aux_jpeg_encoder_)
-                    {
-                        try
-                        {
-                            aux_jpeg_encoder_ = std::make_unique<JpegEncoder>(
-                                "aux/image_rect_color", JpegEncoder::default_candidates(aux_jpeg_quality_),
-                                JpegEncoderOptions{},
-                                [this](const std::string &warning)
-                                { RCLCPP_WARN(get_logger(), "MultiSense: %s", warning.c_str()); });
-                        }
-                        catch (const std::exception &e)
-                        {
-                            RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 5000, "MultiSense: %s", e.what());
-                            return nullptr;
-                        }
-                    }
                     auto jpeg = aux_jpeg_encoder_->encode(job.luma->data() + job.luma_offset,
                                                           job.chroma->data() + job.chroma_offset,
                                                           job.width, job.height);
-                    if (!jpeg)
+                    if (aux_jpeg_encoder_->encoder_name() != aux_jpeg_logged_encoder_)
                     {
-                        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
-                                             "MultiSense: aux/image_rect_color JPEG frame not encoded; dropped");
-                    }
-                    else if (aux_jpeg_encoder_->encoder_element() != aux_jpeg_logged_element_)
-                    {
-                        aux_jpeg_logged_element_ = aux_jpeg_encoder_->encoder_element();
+                        aux_jpeg_logged_encoder_ = aux_jpeg_encoder_->encoder_name();
                         RCLCPP_INFO(get_logger(), "MultiSense: encoding aux/image_rect_color as JPEG with %s",
-                                    aux_jpeg_logged_element_.c_str());
+                                    aux_jpeg_logged_encoder_.c_str());
                     }
                     return jpeg;
                 },

@@ -390,10 +390,10 @@ private:
     bool aux_jpeg_ = false;
     int aux_jpeg_quality_ = 75;
     rclcpp::Publisher<sensor_msgs::msg::CompressedImage>::SharedPtr aux_rect_jpeg_pub_ = nullptr;
+    // Touched only from the worker's thread, and declared first so the worker goes before them
+    std::unique_ptr<AuxJpegEncoder> aux_jpeg_encoder_ = nullptr;
+    std::string aux_jpeg_logged_encoder_;
     std::unique_ptr<AuxJpegWorker> aux_jpeg_worker_ = nullptr;
-    // Touched only from the worker's thread
-    std::unique_ptr<JpegEncoder> aux_jpeg_encoder_ = nullptr;
-    std::string aux_jpeg_logged_element_;
 
     //
     // H.264 access units as published by the camera, created only when h264_images_ is set

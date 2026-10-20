@@ -50,6 +50,8 @@ def multisense_setup(context, *args, **kwargs):
         'executable': 'ros_driver',
         'output': 'screen',
         'namespace': namespace,
+        'respawn': LaunchConfiguration('respawn').perform(context) == 'true',
+        'respawn_delay': float(LaunchConfiguration('respawn_delay').perform(context)),
     }
 
     # Apply YAML first, then inline params (inline can override YAML on key conflicts)
@@ -113,6 +115,19 @@ def generate_launch_description():
         description='Optional path to a YAML parameter file'
     )
 
+    respawn = DeclareLaunchArgument(
+        name='respawn',
+        default_value='false',
+        choices=['true', 'false'],
+        description='Restart ros_driver whenever it exits, so a crash does not leave the camera dark'
+    )
+
+    respawn_delay = DeclareLaunchArgument(
+        name='respawn_delay',
+        default_value='2.0',
+        description='Seconds between ros_driver exiting and its restart, with respawn:=true'
+    )
+
     robot_state_publisher = Node(
         package='robot_state_publisher',
         executable='robot_state_publisher',
@@ -144,6 +159,8 @@ def generate_launch_description():
         reconnect_timeout_s,
         publish_static_tf,
         params_file_arg,
+        respawn,
+        respawn_delay,
         robot_state_publisher,
         OpaqueFunction(function=multisense_setup),
     ])

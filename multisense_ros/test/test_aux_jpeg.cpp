@@ -8,13 +8,18 @@
 
 #include <gtest/gtest.h>
 
-#include <chrono>
+#include <dlfcn.h>
+#include <link.h>
+
+#include <algorithm>
 #include <cmath>
-#include <fstream>
-#include <thread>
+#include <new>
+#include <stdexcept>
+#include <string>
 #include <cstdint>
 #include <memory>
 #include <random>
+#include <set>
 #include <vector>
 
 #include <opencv2/imgcodecs.hpp>
@@ -135,19 +140,7 @@ TEST(AuxJpeg, I420FillCopiesLumaAndSplitsChroma)
     EXPECT_EQ(i420[11], lut.cr[78]);
 }
 
-class EachEncoder : public ::testing::TestWithParam<std::string>
-{
-protected:
-    void SetUp() override
-    {
-        if (!JpegEncoder::available() || !JpegEncoder::has_encoder(GetParam()))
-        {
-            GTEST_SKIP() << GetParam() << " is not installed here";
-        }
-    }
-};
-
-TEST_P(EachEncoder, DecodesAtLeastAsCloseToTheRawImageAsTheReencodeDid)
+TEST(AuxJpeg, DecodesAtLeastAsCloseToTheRawImageAsTheReencodeDid)
 {
     std::vector<uint8_t> luma, chroma;
     camera_planes(luma, chroma);
@@ -158,10 +151,9 @@ TEST_P(EachEncoder, DecodesAtLeastAsCloseToTheRawImageAsTheReencodeDid)
     ASSERT_TRUE(cv::imencode(".jpg", raw, old_jpeg, {cv::IMWRITE_JPEG_QUALITY, 75}));
     const double old_psnr = psnr(cv::imdecode(old_jpeg, cv::IMREAD_COLOR), raw);
 
-    JpegEncoder encoder{"test", 75, {GetParam()}};
+    JpegEncoder encoder{75};
     const auto jpeg = encoder.encode(luma.data(), chroma.data(), W, H);
     ASSERT_NE(jpeg, nullptr);
-    EXPECT_EQ(encoder.encoder_element(), GetParam());
     const cv::Mat decoded = cv::imdecode(*jpeg, cv::IMREAD_COLOR);
     ASSERT_EQ(decoded.cols, W);
     ASSERT_EQ(decoded.rows, H);
@@ -171,11 +163,11 @@ TEST_P(EachEncoder, DecodesAtLeastAsCloseToTheRawImageAsTheReencodeDid)
     EXPECT_LT(static_cast<double>(jpeg->size()), 1.2 * old_jpeg.size());
 }
 
-TEST_P(EachEncoder, ReturnsEveryFrameItIsHanded)
+TEST(AuxJpeg, ReturnsEveryFrameItIsHanded)
 {
     std::vector<uint8_t> luma, chroma;
     camera_planes(luma, chroma);
-    JpegEncoder encoder{"test", 75, {GetParam()}};
+    JpegEncoder encoder{75};
     for (int frame = 0; frame < 5; ++frame)
     {
         std::fill(luma.begin(), luma.begin() + W * 8, static_cast<uint8_t>(frame * 40));
@@ -183,194 +175,30 @@ TEST_P(EachEncoder, ReturnsEveryFrameItIsHanded)
         ASSERT_NE(jpeg, nullptr) << frame;
         const cv::Mat decoded = cv::imdecode(*jpeg, cv::IMREAD_GRAYSCALE);
         ASSERT_EQ(decoded.cols, W);
-        // The frame handed in, not one queued before it.
         EXPECT_NEAR(decoded.at<uint8_t>(2, W / 2), frame * 40, 6) << frame;
     }
 }
 
-INSTANTIATE_TEST_SUITE_P(Encoders, EachEncoder, ::testing::Values("nvjpegenc", "jpegenc"));
-
 TEST(AuxJpeg, QualityOutsideOneToHundredIsRefused)
 {
-    if (!JpegEncoder::available())
-    {
-        GTEST_SKIP() << "built without GStreamer";
-    }
-    EXPECT_THROW(JpegEncoder("test", 0), std::invalid_argument);
-    EXPECT_THROW(JpegEncoder("test", 101), std::invalid_argument);
+    EXPECT_THROW(JpegEncoder{0}, std::invalid_argument);
+    EXPECT_THROW(JpegEncoder{101}, std::invalid_argument);
 }
 
-namespace {
-
-constexpr int BIG_W = 1920;
-constexpr int BIG_H = 1200;
-
-// Never delivers a JPEG: a candidate that starts but gives nothing back.
-const EncoderCandidate SILENT{"silent", "valve drop=true ! jpegenc"};
-
-JpegEncoderOptions quick()
+TEST(AuxJpeg, AnOddSizeIsRefusedNotEncodedWithShearedChroma)
 {
-    JpegEncoderOptions options;
-    options.first_frame_timeout = std::chrono::milliseconds{300};
-    options.frame_timeout = std::chrono::milliseconds{100};
-    options.timeout_after_miss = std::chrono::milliseconds{5};
-    return options;
+    JpegEncoder encoder{75};
+    std::vector<uint8_t> luma(5 * 4, 90), chroma(5 * 4, 128);
+    EXPECT_THROW(encoder.encode(luma.data(), chroma.data(), 5, 4), std::invalid_argument);
+    EXPECT_THROW(encoder.encode(luma.data(), chroma.data(), 4, 5), std::invalid_argument);
 }
 
-size_t resident_bytes()
+TEST(AuxJpeg, ASizeOffTheMcuGridEncodesTheRightPicture)
 {
-    std::ifstream statm{"/proc/self/statm"};
-    size_t pages = 0, resident = 0;
-    statm >> pages >> resident;
-    return resident * static_cast<size_t>(sysconf(_SC_PAGESIZE));
-}
-
-class Gst : public ::testing::Test
-{
-protected:
-    void SetUp() override
-    {
-        if (!JpegEncoder::available() || !JpegEncoder::has_encoder("jpegenc"))
-        {
-            GTEST_SKIP() << "jpegenc is not installed here";
-        }
-    }
-};
-
-}
-
-TEST(AuxJpeg, OnlyThePushedFrameIsAccepted)
-{
-    EXPECT_TRUE(accept_sample(7, 7, 1));
-    EXPECT_FALSE(accept_sample(6, 7, 2)) << "an older frame queued from a late encode";
-    // An encoder that drops timestamps: the sample can only be ours when ours is the only one out.
-    EXPECT_TRUE(accept_sample(std::nullopt, 7, 1));
-    EXPECT_FALSE(accept_sample(std::nullopt, 7, 2));
-}
-
-TEST_F(Gst, NoInstalledCandidateFailsAtConstruction)
-{
-    EXPECT_THROW(JpegEncoder("test", 75, std::vector<std::string>{"no_such_jpeg_encoder"}), std::runtime_error);
-}
-
-TEST_F(Gst, AStalledEncoderKeepsMemoryFlat)
-{
-    // An encoder that has delivered, then falls far behind: every later push must be dropped
-    // or bounded, never queued: a 1920x1200 frame is 3.5 MB.
-    auto options = quick();
-    options.first_frame_timeout = std::chrono::milliseconds{3000};
-    options.misses_before_fallback = 1000;
-    JpegEncoder encoder{"test", {{"stalled", "identity sleep-time=1000000 ! jpegenc"}}, options, nullptr};
-    std::vector<uint8_t> luma(BIG_W * BIG_H, 90), chroma(BIG_W * BIG_H / 2, 128);
-    ASSERT_NE(encoder.encode(luma.data(), chroma.data(), BIG_W, BIG_H), nullptr);
-    const size_t before = resident_bytes();
-    for (int i = 0; i < 60; ++i)
-    {
-        encoder.encode(luma.data(), chroma.data(), BIG_W, BIG_H);
-    }
-    EXPECT_LE(encoder.queued_frames(), options.max_queued_frames);
-    EXPECT_LT(resident_bytes(), before + 30u * 1024 * 1024);
-}
-
-TEST_F(Gst, ASlowFirstFrameDoesNotGiveUpTheEncoder)
-{
-    // NVJPG or CUDA set-up can take a second on the first frame.
-    std::vector<std::string> warnings;
-    auto options = quick();
-    options.first_frame_timeout = std::chrono::milliseconds{2000};
-    JpegEncoder encoder{"test",
-                        {{"slow", "identity sleep-time=600000 ! jpegenc"}, {"jpegenc", "jpegenc"}},
-                        options, [&](const std::string &w) { warnings.push_back(w); }};
-    std::vector<uint8_t> luma(W * H, 90), chroma(W * H / 2, 128);
-    EXPECT_NE(encoder.encode(luma.data(), chroma.data(), W, H), nullptr);
-    EXPECT_EQ(encoder.encoder_element(), "slow");
-    EXPECT_TRUE(warnings.empty());
-}
-
-TEST_F(Gst, FallsBackOnlyAfterSeveralMissesAndSaysSo)
-{
-    std::vector<std::string> warnings;
-    auto options = quick();
-    options.misses_before_fallback = 3;
-    JpegEncoder encoder{"test", {SILENT, {"jpegenc", "jpegenc"}}, options,
-                        [&](const std::string &w) { warnings.push_back(w); }};
-    std::vector<uint8_t> luma(W * H, 90), chroma(W * H / 2, 128);
-    for (int miss = 0; miss < 2; ++miss)
-    {
-        EXPECT_EQ(encoder.encode(luma.data(), chroma.data(), W, H), nullptr);
-        EXPECT_EQ(encoder.encoder_element(), "silent") << miss;
-    }
-    EXPECT_EQ(encoder.encode(luma.data(), chroma.data(), W, H), nullptr);
-    EXPECT_NE(encoder.encode(luma.data(), chroma.data(), W, H), nullptr);
-    EXPECT_EQ(encoder.encoder_element(), "jpegenc");
-    ASSERT_EQ(warnings.size(), 1u);
-    EXPECT_NE(warnings[0].find("silent"), std::string::npos);
-    EXPECT_NE(warnings[0].find("jpegenc"), std::string::npos);
-}
-
-TEST_F(Gst, ANewFrameSizeRetriesEveryCandidate)
-{
-    std::vector<std::string> warnings;
-    auto options = quick();
-    options.misses_before_fallback = 1;
-    JpegEncoder encoder{"test", {SILENT, {"jpegenc", "jpegenc"}}, options,
-                        [&](const std::string &w) { warnings.push_back(w); }};
-    std::vector<uint8_t> luma(W * H, 90), chroma(W * H / 2, 128);
-    encoder.encode(luma.data(), chroma.data(), W, H);
-    ASSERT_NE(encoder.encode(luma.data(), chroma.data(), W, H), nullptr);
-    ASSERT_EQ(warnings.size(), 1u);
-    // The new mode starts from the preferred encoder again, which here fails again.
-    encoder.encode(luma.data(), chroma.data(), W / 2, H / 2);
-    EXPECT_NE(encoder.encode(luma.data(), chroma.data(), W / 2, H / 2), nullptr);
-    EXPECT_EQ(warnings.size(), 2u);
-}
-
-TEST_F(Gst, AnEncoderWedgedAfterDeliveringIsRebuilt)
-{
-    // Delivers, then stops answering: past the limit the pipeline is torn down and started again.
-    std::vector<std::string> warnings;
-    auto options = quick();
-    options.first_frame_timeout = std::chrono::milliseconds{3000};
-    options.failures_before_restart = 5;
-    JpegEncoder encoder{"test", {{"stalled", "identity sleep-time=1000000 ! jpegenc"}}, options,
-                        [&](const std::string &w) { warnings.push_back(w); }};
-    std::vector<uint8_t> luma(W * H, 90), chroma(W * H / 2, 128);
-    ASSERT_NE(encoder.encode(luma.data(), chroma.data(), W, H), nullptr);
-    for (int i = 0; i < 5; ++i)
-    {
-        encoder.encode(luma.data(), chroma.data(), W, H);
-    }
-    ASSERT_EQ(warnings.size(), 1u);
-    EXPECT_NE(warnings[0].find("restart"), std::string::npos) << warnings[0];
-}
-
-TEST_F(Gst, EncodersThatWillNotStartAreRetriedOnATimerNotEveryFrame)
-{
-    std::vector<std::string> warnings;
-    auto options = quick();
-    options.start_retry = std::chrono::milliseconds{300};
-    JpegEncoder encoder{"test", {{"broken", "jpegenc no_such_property=1"}}, options,
-                        [&](const std::string &w) { warnings.push_back(w); }};
-    std::vector<uint8_t> luma(W * H, 90), chroma(W * H / 2, 128);
-    for (int i = 0; i < 20; ++i)
-    {
-        EXPECT_EQ(encoder.encode(luma.data(), chroma.data(), W, H), nullptr);
-    }
-    EXPECT_EQ(warnings.size(), 1u);
-    std::this_thread::sleep_for(std::chrono::milliseconds{400});
-    encoder.encode(luma.data(), chroma.data(), W, H);
-    EXPECT_EQ(warnings.size(), 2u);
-    // A new frame size is tried at once.
-    encoder.encode(luma.data(), chroma.data(), W / 2, H / 2);
-    EXPECT_EQ(warnings.size(), 3u);
-}
-
-TEST_F(Gst, AWidthWhoseChromaRowIsNotFourBytesEncodesTheRightPicture)
-{
-    // GStreamer pads I420 rows to 4 bytes: at 644 wide the chroma rows are 322 bytes of data
-    // in 324. Packed planes would shear the colour.
+    // 644 x 202 leaves 4 columns and 10 rows of a 16 x 16 MCU over: libjpeg's raw input reads
+    // the padding, so it must be there and must not bleed into the picture.
     constexpr int w = 644;
-    constexpr int h = 200;
+    constexpr int h = 202;
     std::vector<uint8_t> luma(w * h), chroma(w * h / 2);
     for (int y = 0; y < h; ++y)
         for (int x = 0; x < w; ++x)
@@ -383,10 +211,351 @@ TEST_F(Gst, AWidthWhoseChromaRowIsNotFourBytesEncodesTheRightPicture)
         }
     cv::Mat raw(h, w, CV_8UC3);
     YCbCr420ToBgr{}(luma.data(), chroma.data(), w, h, raw.data);
-    JpegEncoder encoder{"test", 90, std::vector<std::string>{"jpegenc"}};
+    JpegEncoder encoder{90};
     const auto jpeg = encoder.encode(luma.data(), chroma.data(), w, h);
-    ASSERT_NE(jpeg, nullptr);
     const cv::Mat decoded = cv::imdecode(*jpeg, cv::IMREAD_COLOR);
     ASSERT_EQ(decoded.cols, w);
+    ASSERT_EQ(decoded.rows, h);
     EXPECT_GT(cv::PSNR(decoded, raw), 30.0);
+    const cv::Rect edge{w - 8, h - 8, 8, 8};
+    EXPECT_GT(cv::PSNR(decoded(edge), raw(edge)), 30.0);
+}
+
+namespace {
+
+std::string base_name(const char *path)
+{
+    const std::string name = path == nullptr ? "" : path;
+    return name.substr(name.find_last_of('/') + 1);
+}
+
+// Every loaded object that exports libjpeg's entry point under its own name. Copies with
+// renamed symbols (gdcm's gdcmjpeg8_*) cannot collide and are not counted.
+std::set<std::string> libjpeg_providers()
+{
+    std::vector<std::string> loaded;
+    dl_iterate_phdr(
+        [](dl_phdr_info *info, size_t, void *data)
+        {
+            if (info->dlpi_name != nullptr && info->dlpi_name[0] != '\0')
+            {
+                static_cast<std::vector<std::string> *>(data)->push_back(info->dlpi_name);
+            }
+            return 0;
+        },
+        &loaded);
+    std::set<std::string> out;
+    for (const auto &path : loaded)
+    {
+        void *handle = dlopen(path.c_str(), RTLD_LAZY | RTLD_NOLOAD);
+        if (handle == nullptr)
+        {
+            continue;
+        }
+        Dl_info info{};
+        if (void *symbol = dlsym(handle, "jpeg_CreateCompress"); symbol != nullptr &&
+            dladdr(symbol, &info) != 0)
+        {
+            out.insert(base_name(info.dli_fname));
+        }
+        dlclose(handle);
+    }
+    return out;
+}
+
+// The library any normally linked caller of libjpeg reaches: OpenCV, image_transport's
+// plugins, and the GStreamer elements that brought NVJPG in before.
+std::string global_libjpeg()
+{
+    Dl_info info{};
+    void *symbol = dlsym(RTLD_DEFAULT, "jpeg_CreateCompress");
+    return symbol != nullptr && dladdr(symbol, &info) != 0 ? base_name(info.dli_fname) : "";
+}
+
+bool nvjpg_here()
+{
+    std::string error;
+    return NvJpegEncoder::create(75, W, H, &error) != nullptr;
+}
+
+}
+
+TEST(AuxJpeg, TheDriversEncoderLeavesOpenCvItsLibjpegInTheSameProcess)
+{
+    // The driver also holds OpenCV's imgcodecs. NVJPG's libjpeg 9 bound in its place killed
+    // the driver on the first subscriber ("JPEG parameter struct mismatch: library thinks
+    // size is 584, caller expects 1008"), so OpenCV runs first here, then the driver's
+    // encoder, NVJPG where this host has it, then OpenCV again.
+    std::vector<uint8_t> luma, chroma;
+    camera_planes(luma, chroma);
+    std::vector<uint8_t> opencv_jpeg;
+    ASSERT_TRUE(cv::imencode(".jpg", raw_bgr(luma, chroma), opencv_jpeg));
+
+    std::vector<std::string> warnings;
+    AuxJpegEncoder encoder{75, AuxJpegEncoder::nvjpg(75), "NVJPG",
+                           [&](const std::string &w) { warnings.push_back(w); }};
+    for (int frame = 0; frame < 3; ++frame)
+    {
+        const auto jpeg = encoder.encode(luma.data(), chroma.data(), W, H);
+        ASSERT_EQ(cv::imdecode(*jpeg, cv::IMREAD_COLOR).cols, W);
+    }
+    ASSERT_FALSE(cv::imdecode(opencv_jpeg, cv::IMREAD_COLOR).empty());
+    std::vector<uint8_t> again;
+    ASSERT_TRUE(cv::imencode(".jpg", raw_bgr(luma, chroma), again));
+
+    EXPECT_EQ(global_libjpeg().rfind("libjpeg.so.8", 0), 0u) << global_libjpeg();
+    for (const auto &provider : libjpeg_providers())
+    {
+        EXPECT_TRUE(provider.rfind("libjpeg.so.8", 0) == 0 || provider == "libnvmm_jpeg.so") << provider;
+    }
+    if (nvjpg_here())
+    {
+        // Where NVJPG exists it must be the one running, not quietly given up.
+        EXPECT_EQ(encoder.encoder_name(), "NVJPG") << ::testing::PrintToString(warnings);
+        EXPECT_TRUE(warnings.empty()) << ::testing::PrintToString(warnings);
+    }
+    else
+    {
+        EXPECT_EQ(encoder.encoder_name(), "libjpeg-turbo");
+    }
+}
+
+TEST(AuxJpeg, NvjpgDecodesAsCloseToTheRawImageAsLibjpegTurbo)
+{
+    std::string error;
+    auto nvjpg = NvJpegEncoder::create(75, W, H, &error);
+    if (!nvjpg)
+    {
+        GTEST_SKIP() << "no NVJPG here: " << error;
+    }
+    std::vector<uint8_t> luma, chroma;
+    camera_planes(luma, chroma);
+    const cv::Mat raw = raw_bgr(luma, chroma);
+    const auto turbo = JpegEncoder{75}.encode(luma.data(), chroma.data(), W, H);
+    for (int frame = 0; frame < 3; ++frame)
+    {
+        const auto jpeg = nvjpg->encode(luma.data(), chroma.data(), W, H);
+        ASSERT_NE(jpeg, nullptr);
+        EXPECT_GT(psnr(cv::imdecode(*jpeg, cv::IMREAD_COLOR), raw),
+                  psnr(cv::imdecode(*turbo, cv::IMREAD_COLOR), raw) - 1.0) << frame;
+    }
+    EXPECT_THROW(nvjpg->encode(luma.data(), chroma.data(), W / 2, H / 2), std::invalid_argument);
+}
+
+namespace {
+
+// What a hardware encoder can get wrong while still running.
+enum class Fault
+{
+    none,
+    blank_surface,      // the CPU's writes never reached the engine
+    swapped_chroma,     // Cb and Cr planes in each other's place
+    wrong_pitch,        // rows written 8 bytes short of the surface's pitch
+    not_jpeg_later,     // a right check frame, then bytes that are no JPEG
+};
+
+// A stand-in for NVJPG: libjpeg-turbo, with the fault applied to what it encodes.
+AuxJpegEncoder::HardwareFactory fake_hardware(int *made, Fault fault = Fault::none)
+{
+    return [made, fault](int, int, std::string *) -> JpegFrameEncoder
+    {
+        ++*made;
+        auto cpu = std::make_shared<JpegEncoder>(75);
+        auto calls = std::make_shared<int>(0);
+        return [cpu, calls, fault](const uint8_t *luma, const uint8_t *chroma, int w, int h)
+            -> std::shared_ptr<std::vector<uint8_t>>
+        {
+            const size_t pixels = static_cast<size_t>(w) * h;
+            std::vector<uint8_t> y(luma, luma + pixels);
+            std::vector<uint8_t> c(chroma, chroma + pixels / 2);
+            switch (fault)
+            {
+            case Fault::none:
+                break;
+            case Fault::blank_surface:
+                std::fill(y.begin(), y.end(), 0);
+                std::fill(c.begin(), c.end(), 128);
+                break;
+            case Fault::swapped_chroma:
+                for (size_t i = 0; i + 1 < c.size(); i += 2)
+                {
+                    std::swap(c[i], c[i + 1]);
+                }
+                break;
+            case Fault::wrong_pitch:
+                for (size_t row = 0; row < static_cast<size_t>(h); ++row)
+                {
+                    std::copy(luma + row * (w - 8), luma + row * (w - 8) + w, y.begin() + row * w);
+                }
+                break;
+            case Fault::not_jpeg_later:
+                if (++*calls > 1)
+                {
+                    return std::make_shared<std::vector<uint8_t>>(std::vector<uint8_t>{0xFF, 0xD8, 0x00, 0x00});
+                }
+                break;
+            }
+            return cpu->encode(y.data(), c.data(), w, h);
+        };
+    };
+}
+
+}
+
+TEST(AuxJpeg, AWorkingHardwareEncoderKeepsEveryFrame)
+{
+    int made = 0;
+    std::vector<std::string> warnings;
+    AuxJpegEncoder encoder{75, fake_hardware(&made), "fake",
+                           [&](const std::string &w) { warnings.push_back(w); }};
+    std::vector<uint8_t> luma, chroma;
+    camera_planes(luma, chroma);
+    for (int frame = 0; frame < 3; ++frame)
+    {
+        ASSERT_NE(encoder.encode(luma.data(), chroma.data(), W, H), nullptr);
+        EXPECT_EQ(encoder.encoder_name(), "fake");
+    }
+    EXPECT_EQ(made, 1);
+    EXPECT_TRUE(warnings.empty());
+    // A new frame size gets an encoder of its own.
+    encoder.encode(luma.data(), chroma.data(), W / 2, H / 2);
+    EXPECT_EQ(made, 2);
+}
+
+TEST(AuxJpeg, AHardwareEncoderThatCannotStartLeavesLibjpegTurboWithOneWarning)
+{
+    std::vector<std::string> warnings;
+    int asked = 0;
+    AuxJpegEncoder encoder{75,
+                           [&](int, int, std::string *error) -> JpegFrameEncoder
+                           {
+                               ++asked;
+                               *error = "no engine";
+                               return nullptr;
+                           },
+                           "fake", [&](const std::string &w) { warnings.push_back(w); }};
+    std::vector<uint8_t> luma, chroma;
+    camera_planes(luma, chroma);
+    for (int frame = 0; frame < 3; ++frame)
+    {
+        ASSERT_NE(encoder.encode(luma.data(), chroma.data(), W, H), nullptr);
+        EXPECT_EQ(encoder.encoder_name(), "libjpeg-turbo");
+    }
+    EXPECT_EQ(asked, 1);
+    ASSERT_EQ(warnings.size(), 1u);
+    EXPECT_NE(warnings[0].find("fake unavailable: no engine"), std::string::npos) << warnings[0];
+}
+
+TEST(AuxJpeg, AHardwareEncoderThatThrowsIsGivenUpAndItsFrameStillEncoded)
+{
+    std::vector<std::string> warnings;
+    int calls = 0;
+    AuxJpegEncoder encoder{75,
+                           [&](int, int, std::string *) -> JpegFrameEncoder
+                           {
+                               return [&](const uint8_t *, const uint8_t *, int, int)
+                                   -> std::shared_ptr<std::vector<uint8_t>>
+                               {
+                                   ++calls;
+                                   throw std::runtime_error("engine wedged");
+                               };
+                           },
+                           "fake", [&](const std::string &w) { warnings.push_back(w); }};
+    std::vector<uint8_t> luma, chroma;
+    camera_planes(luma, chroma);
+    const auto jpeg = encoder.encode(luma.data(), chroma.data(), W, H);
+    ASSERT_NE(jpeg, nullptr);
+    EXPECT_EQ(cv::imdecode(*jpeg, cv::IMREAD_COLOR).cols, W);
+    encoder.encode(luma.data(), chroma.data(), W, H);
+    EXPECT_EQ(calls, 1);
+    EXPECT_EQ(encoder.encoder_name(), "libjpeg-turbo");
+    ASSERT_EQ(warnings.size(), 1u);
+    EXPECT_NE(warnings[0].find("engine wedged"), std::string::npos) << warnings[0];
+}
+
+class WrongPicture : public ::testing::TestWithParam<Fault> {};
+
+TEST_P(WrongPicture, NeverReachesASubscriberEvenWhenTheCameraStartsOnAFlatFrame)
+{
+    // A flat frame looks the same through every one of these faults, so the hardware is
+    // judged on its check frame, not on what the camera sends first.
+    int made = 0;
+    std::vector<std::string> warnings;
+    AuxJpegEncoder encoder{75, fake_hardware(&made, GetParam()), "fake",
+                           [&](const std::string &w) { warnings.push_back(w); }};
+    std::vector<uint8_t> flat_luma(W * H, 120), flat_chroma(W * H / 2, 128);
+    const auto jpeg = encoder.encode(flat_luma.data(), flat_chroma.data(), W, H);
+    const auto turbo = JpegEncoder{75}.encode(flat_luma.data(), flat_chroma.data(), W, H);
+    EXPECT_EQ(*jpeg, *turbo);
+    EXPECT_EQ(encoder.encoder_name(), "libjpeg-turbo");
+    ASSERT_EQ(warnings.size(), 1u);
+    EXPECT_NE(warnings[0].find("check frame"), std::string::npos) << warnings[0];
+    std::vector<uint8_t> luma, chroma;
+    camera_planes(luma, chroma);
+    encoder.encode(luma.data(), chroma.data(), W, H);
+    EXPECT_EQ(made, 1);
+    EXPECT_EQ(warnings.size(), 1u);
+}
+
+INSTANTIATE_TEST_SUITE_P(Faults, WrongPicture,
+                         ::testing::Values(Fault::blank_surface, Fault::swapped_chroma, Fault::wrong_pitch));
+
+TEST(AuxJpeg, AHardwareEncoderThatLaterReturnsNoJpegIsGivenUp)
+{
+    int made = 0;
+    std::vector<std::string> warnings;
+    AuxJpegEncoder encoder{75, fake_hardware(&made, Fault::not_jpeg_later), "fake",
+                           [&](const std::string &w) { warnings.push_back(w); }};
+    std::vector<uint8_t> luma, chroma;
+    camera_planes(luma, chroma);
+    const auto jpeg = encoder.encode(luma.data(), chroma.data(), W, H);
+    EXPECT_EQ(cv::imdecode(*jpeg, cv::IMREAD_COLOR).cols, W);
+    EXPECT_EQ(encoder.encoder_name(), "libjpeg-turbo");
+    ASSERT_EQ(warnings.size(), 1u);
+    EXPECT_NE(warnings[0].find("returned no JPEG"), std::string::npos) << warnings[0];
+}
+
+TEST(AuxJpeg, AFactoryThatThrowsIsGivenUpForGood)
+{
+    int asked = 0;
+    std::vector<std::string> warnings;
+    AuxJpegEncoder encoder{75,
+                           [&](int, int, std::string *) -> JpegFrameEncoder
+                           {
+                               ++asked;
+                               throw std::bad_alloc();
+                           },
+                           "fake", [&](const std::string &w) { warnings.push_back(w); }};
+    std::vector<uint8_t> luma, chroma;
+    camera_planes(luma, chroma);
+    for (int frame = 0; frame < 3; ++frame)
+    {
+        ASSERT_NE(encoder.encode(luma.data(), chroma.data(), W, H), nullptr);
+    }
+    EXPECT_EQ(asked, 1);
+    EXPECT_EQ(warnings.size(), 1u);
+}
+
+TEST(AuxJpeg, AnOddSizeDropsTheFrameButNotTheHardwareEncoder)
+{
+    int made = 0;
+    std::vector<std::string> warnings;
+    AuxJpegEncoder encoder{75, fake_hardware(&made), "fake",
+                           [&](const std::string &w) { warnings.push_back(w); }};
+    std::vector<uint8_t> luma(5 * 4, 90), chroma(5 * 4, 128);
+    EXPECT_THROW(encoder.encode(luma.data(), chroma.data(), 5, 4), std::invalid_argument);
+    std::vector<uint8_t> big_luma, big_chroma;
+    camera_planes(big_luma, big_chroma);
+    encoder.encode(big_luma.data(), big_chroma.data(), W, H);
+    EXPECT_EQ(encoder.encoder_name(), "fake");
+    EXPECT_TRUE(warnings.empty());
+}
+
+TEST(AuxJpeg, TheSameJpegDecodesFarAboveTheHardwareCheckAndGarbageAtZero)
+{
+    std::vector<uint8_t> luma, chroma;
+    camera_planes(luma, chroma);
+    const auto jpeg = JpegEncoder{75}.encode(luma.data(), chroma.data(), W, H);
+    EXPECT_GT(decoded_psnr(*jpeg, *jpeg), 60.0);
+    EXPECT_EQ(decoded_psnr(*jpeg, std::vector<uint8_t>{0xFF, 0xD8, 0x00}), 0.0);
 }
