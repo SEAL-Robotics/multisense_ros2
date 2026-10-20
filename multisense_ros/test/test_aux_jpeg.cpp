@@ -264,7 +264,7 @@ std::set<std::string> libjpeg_providers()
 }
 
 // The library any normally linked caller of libjpeg reaches: OpenCV, image_transport's
-// plugins, and the GStreamer elements that brought NVJPG in before.
+// plugins, and GStreamer's nvjpegenc.
 std::string global_libjpeg()
 {
     Dl_info info{};
@@ -282,7 +282,7 @@ bool nvjpg_here()
 
 TEST(AuxJpeg, TheDriversEncoderLeavesOpenCvItsLibjpegInTheSameProcess)
 {
-    // The driver also holds OpenCV's imgcodecs. NVJPG's libjpeg 9 bound in its place killed
+    // The driver also holds OpenCV's imgcodecs. NVJPG's libjpeg 9 bound in its place kills
     // the driver on the first subscriber ("JPEG parameter struct mismatch: library thinks
     // size is 584, caller expects 1008"), so OpenCV runs first here, then the driver's
     // encoder, NVJPG where this host has it, then OpenCV again.
