@@ -3,8 +3,10 @@
  **/
 
 #include <multisense_ros/h264_decoder.h>
+#include <multisense_ros/h264_pull.h>
 
 #include <cstring>
+#include <optional>
 #include <stdexcept>
 
 #ifdef MULTISENSE_ROS_HAVE_GSTREAMER
@@ -20,12 +22,11 @@ namespace multisense_ros {
 
 namespace {
 
-// Every S27 H.264 frame is an IDR carrying its own SPS/PPS, so no frame
-// depends on another and one not out within this window is dropped. After a
-// miss the short window keeps a failing stream from stalling every other
-// topic the shared publisher thread serves; a decode takes ~4 ms on NVDEC.
-constexpr GstClockTime PULL_TIMEOUT = 200 * GST_MSECOND;
-constexpr GstClockTime PULL_TIMEOUT_AFTER_MISS = 20 * GST_MSECOND;
+struct SampleUnref
+{
+    void operator()(GstSample *sample) const { gst_sample_unref(sample); }
+};
+using SamplePtr = std::unique_ptr<GstSample, SampleUnref>;
 
 bool has_element(const char *name)
 {
@@ -46,7 +47,7 @@ struct H264Decoder::Pipeline
     GstElement *src = nullptr;
     GstElement *sink = nullptr;
     guint64 frame_count = 0;
-    bool last_missed = false;
+    H264FrameMatcher matcher;
 
     ~Pipeline()
     {
@@ -127,23 +128,26 @@ std::shared_ptr<std::vector<uint8_t>> H264Decoder::decode(const uint8_t *data,
         return nullptr;
     }
 
-    // The caller stamps the result with this frame's capture time, so an older
-    // frame still queued from a late decode must be dropped, never returned.
-    const GstClockTime timeout = pipeline_->last_missed ? PULL_TIMEOUT_AFTER_MISS : PULL_TIMEOUT;
-    GstSample *sample = nullptr;
-    while ((sample = gst_app_sink_try_pull_sample(GST_APP_SINK(pipeline_->sink), timeout)) != nullptr)
-    {
-        if (GST_BUFFER_PTS(gst_sample_get_buffer(sample)) == pts)
+    auto matched = pipeline_->matcher.match<SamplePtr>(
+        pts,
+        [this](uint64_t timeout) -> std::optional<SamplePtr>
         {
-            break;
-        }
-        gst_sample_unref(sample);
-    }
-    pipeline_->last_missed = (sample == nullptr);
-    if (sample == nullptr)
+            GstSample *pulled = gst_app_sink_try_pull_sample(GST_APP_SINK(pipeline_->sink), timeout);
+            if (pulled == nullptr)
+            {
+                return std::nullopt;
+            }
+            return SamplePtr(pulled);
+        },
+        [](const SamplePtr &pulled)
+        {
+            return static_cast<uint64_t>(GST_BUFFER_PTS(gst_sample_get_buffer(pulled.get())));
+        });
+    if (!matched)
     {
         return nullptr;
     }
+    GstSample *sample = matched->get();
 
     std::shared_ptr<std::vector<uint8_t>> out = nullptr;
     GstVideoInfo info;
@@ -163,7 +167,6 @@ std::shared_ptr<std::vector<uint8_t>> H264Decoder::decode(const uint8_t *data,
         gst_video_frame_unmap(&frame);
     }
 
-    gst_sample_unref(sample);
     return out;
 }
 
