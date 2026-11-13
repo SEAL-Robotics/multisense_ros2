@@ -47,7 +47,7 @@ struct H264Decoder::Pipeline
     GstElement *src = nullptr;
     GstElement *sink = nullptr;
     guint64 frame_count = 0;
-    H264FrameMatcher matcher;
+    H264FrameMatcher matcher{GST_MSECOND};
 
     ~Pipeline()
     {
@@ -125,6 +125,7 @@ std::shared_ptr<std::vector<uint8_t>> H264Decoder::decode(const uint8_t *data,
     GST_BUFFER_PTS(buffer) = pts;
     if (gst_app_src_push_buffer(GST_APP_SRC(pipeline_->src), buffer) != GST_FLOW_OK)
     {
+        last_failure_ = "appsrc refused the buffer";
         return nullptr;
     }
 
@@ -145,6 +146,7 @@ std::shared_ptr<std::vector<uint8_t>> H264Decoder::decode(const uint8_t *data,
         });
     if (!matched)
     {
+        last_failure_ = describe(pipeline_->matcher.report());
         return nullptr;
     }
     GstSample *sample = matched->get();
@@ -165,6 +167,11 @@ std::shared_ptr<std::vector<uint8_t>> H264Decoder::decode(const uint8_t *data,
             std::memcpy(out->data() + static_cast<size_t>(row) * width, plane + static_cast<size_t>(row) * stride, width);
         }
         gst_video_frame_unmap(&frame);
+    }
+    else
+    {
+        last_failure_ = "sample matched but is not a " + std::to_string(width) + "x" + std::to_string(height) +
+                        " frame, or could not be mapped";
     }
 
     return out;
