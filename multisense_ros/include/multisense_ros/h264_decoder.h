@@ -46,10 +46,16 @@ public:
     ///
     const std::string &decoder_element() const { return decoder_element_; }
 
+    ///
+    /// @brief Why the last decode() returned nullptr, for the drop warning
+    ///
+    const std::string &last_failure() const { return last_failure_; }
+
 private:
     struct Pipeline;
     std::unique_ptr<Pipeline> pipeline_;
     std::string decoder_element_;
+    std::string last_failure_;
 };
 
 }

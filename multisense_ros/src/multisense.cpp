@@ -1417,7 +1417,8 @@ void MultiSense::publish_h264_image(const lms::Image &image,
     if (!decoded)
     {
         RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
-                             "MultiSense: %s H.264 frame did not decode; dropped", decoder_name.c_str());
+                             "MultiSense: %s H.264 frame did not decode; dropped (%s)",
+                             decoder_name.c_str(), decoder->last_failure().c_str());
         return;
     }
 
